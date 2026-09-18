@@ -1,0 +1,6 @@
+{
+  "name": "고객언어 UX 라이팅 검수기",
+  "description": "방송·커머스·소개형 서비스와 TV·PC·모바일 환경에 최적화된 고객언어 가이드 기반 자동 교정 및 상황별 톤 레벨 검수 AI 어시스턴트",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
