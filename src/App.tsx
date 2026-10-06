@@ -173,13 +173,14 @@ export default function App() {
     );
   }, []);
 
-  // PDF Guide Handlers
+  // PDF / Document Guide Upload Handler
   const handleUploadNewGuide = async (newGuide: UploadedGuideVersion) => {
-    // Generate semantic chunks for RAG
-    const chunks = chunkLanguageGuideText(
-      `${newGuide.summary}\n${newGuide.changelog || ''}`,
-      { guideId: newGuide.id, defaultCategory: '사내가이드' }
-    );
+    // Generate semantic chunks for RAG using the full document raw content
+    const sourceContent = newGuide.rawContent || `${newGuide.summary}\n${newGuide.changelog || ''}`;
+    const chunks = chunkLanguageGuideText(sourceContent, {
+      guideId: newGuide.id,
+      defaultCategory: '사내가이드',
+    });
 
     // Add structured component rules
     newGuide.extractedRules.componentRules.forEach((cr) => {
@@ -201,6 +202,25 @@ export default function App() {
       });
     });
 
+    // Add structured terminology rules
+    newGuide.extractedRules.terminology?.forEach((t) => {
+      chunks.push({
+        id: `chunk-${newGuide.id}-${t.id}`,
+        guideId: newGuide.id,
+        ruleId: t.id.toUpperCase(),
+        componentType: 'all',
+        category: t.category,
+        title: `${t.category} 순화 (${t.prohibited} -> ${t.recommended})`,
+        description: t.reason,
+        prohibitedPattern: t.prohibited,
+        recommendedPattern: t.recommended,
+        beforeExample: t.prohibited,
+        afterExample: t.recommended,
+        keywords: [t.prohibited, t.recommended, t.category, '순화', '지양'],
+        createdAt: Date.now(),
+      });
+    });
+
     await saveGuideWithChunks(newGuide, chunks);
 
     setGuideVersions((prev) => [
@@ -209,7 +229,7 @@ export default function App() {
     ]);
     setActiveGuideId(newGuide.id);
     showToast(
-      `새 언어 가이드 PDF [${newGuide.title} (${newGuide.version})] 배포 완료! 브라우저 로컬 RAG에 즉시 등록되었습니다.`
+      `새 언어 가이드 [${newGuide.title} (${newGuide.version})] 배포 완료! 총 ${chunks.length}개 규칙이 브라우저 로컬 RAG에 학습되었습니다.`
     );
   };
 
@@ -302,10 +322,40 @@ export default function App() {
         const line = rawLines[idx];
         let locationLabel = '';
         let cleanText = line;
+        let itemComponentType = componentType;
+
         const tagMatch = line.match(/^\[(.*?)\]\s*(.*)$/);
         if (tagMatch) {
           locationLabel = tagMatch[1];
           cleanText = tagMatch[2];
+          if (locationLabel.includes('버튼') || locationLabel.toLowerCase().includes('button')) {
+            itemComponentType = 'button';
+          }
+        } else {
+          const buttonPrefixMatch = line.match(/^(?:버튼|확인\s*버튼|취소\s*버튼|CTA)\s*[:：]?\s*(.*)$/i);
+          if (buttonPrefixMatch) {
+            locationLabel = '버튼 (Action)';
+            cleanText = buttonPrefixMatch[1].trim();
+            itemComponentType = 'button';
+          }
+        }
+
+        // Clean surrounding quotes if any e.g. "예약해주세요" -> 예약해주세요
+        const quoteMatch = cleanText.match(/^["'“‘](.*?)["'”’]$/);
+        if (quoteMatch) {
+          cleanText = quoteMatch[1].trim();
+        }
+
+        // Auto-detect button phrasing e.g. 예약해주세요, 신청해주세요, 이용해주세요
+        if (
+          cleanText.endsWith('해주세요') ||
+          cleanText.endsWith('해 주세요') ||
+          cleanText.endsWith('하기') ||
+          cleanText.includes('버튼')
+        ) {
+          if (itemComponentType === 'general') {
+            itemComponentType = 'button';
+          }
         }
 
         // Retrieve similar past cases from IndexedDB for few-shot prompt injection
@@ -316,7 +366,7 @@ export default function App() {
           inputSentence: cleanText,
           guideTitle: activeGuide.title,
           guideVersion: activeGuide.version,
-          componentType,
+          componentType: itemComponentType,
           service,
           context,
           toneLevel,
@@ -327,7 +377,7 @@ export default function App() {
         const alt1Text = localResult.revised;
         // Derive alt2 (concise / polite alternate)
         let alt2Text = alt1Text;
-        if (componentType === 'button') {
+        if (itemComponentType === 'button') {
           if (alt1Text.endsWith('하기') && alt1Text.length > 2) {
             alt2Text = alt1Text.replace(/하기$/, ''); // e.g. 예약하기 -> 예약 (명사형 대안)
           } else if (alt1Text.length <= 4) {
@@ -345,13 +395,13 @@ export default function App() {
         }
 
         const noSpaceLen = cleanText.replace(/\s+/g, '').length;
-        const limit = componentType === 'button' ? 4 : componentType === 'popup' ? 16 : 40;
+        const limit = itemComponentType === 'button' ? 4 : itemComponentType === 'popup' ? 16 : 40;
 
         items.push({
           id: `item-${Date.now()}-${idx}`,
           originalText: cleanText,
-          locationLabel: locationLabel || (componentType === 'button' ? '버튼 (Action)' : '화면 문구'),
-          componentType,
+          locationLabel: locationLabel || (itemComponentType === 'button' ? '버튼 (Action)' : '화면 문구'),
+          componentType: itemComponentType,
           score: {
             clarity: localResult.needsRevision ? 72 : 96,
             conciseness: localResult.needsRevision ? 68 : 94,

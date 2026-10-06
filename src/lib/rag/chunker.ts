@@ -1,6 +1,7 @@
 /**
- * Semantic Language Guide Chunker
- * Chunks documents into meaningful rule and section units without blindly cutting across sentences or examples.
+ * Semantic Language Guide Chunker & Parser
+ * Comprehensively extracts rules, Before/After examples, terminology pairs,
+ * and component guidelines from user-uploaded documents (TXT, MD, PDF text, direct input).
  */
 
 import { GuideChunk } from '../storage/languageGuideDB';
@@ -11,6 +12,39 @@ export interface ChunkingOptions {
   componentType?: string;
 }
 
+function cleanRuleText(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/^['"“‘]+/, '')
+    .replace(/['"”’]+$/, '')
+    .replace(/^[-*•\s]+/, '')
+    .replace(/[-*•\s]+$/, '')
+    .trim();
+}
+
+function detectComponentType(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.includes('버튼') || lower.includes('button') || lower.includes('cta')) return 'button';
+  if (lower.includes('팝업') || lower.includes('모달') || lower.includes('popup') || lower.includes('modal') || lower.includes('다이얼로그')) return 'popup';
+  if (lower.includes('토스트') || lower.includes('toast') || lower.includes('스낵바')) return 'toast';
+  if (lower.includes('바텀시트') || lower.includes('bottomsheet') || lower.includes('bottom_sheet') || lower.includes('시트')) return 'bottom_sheet';
+  if (lower.includes('레이블') || lower.includes('태그') || lower.includes('배지') || lower.includes('badge') || lower.includes('label')) return 'label';
+  if (lower.includes('툴팁') || lower.includes('tooltip') || lower.includes('도움말')) return 'tooltip';
+  if (lower.includes('오류') || lower.includes('에러') || lower.includes('error') || lower.includes('notice')) return 'notice_error';
+  if (lower.includes('유의사항') || lower.includes('주의사항') || lower.includes('고지') || lower.includes('precaution')) return 'precaution';
+  if (lower.includes('인풋') || lower.includes('텍스트필드') || lower.includes('입력창') || lower.includes('textfield')) return 'textfield';
+  return 'all';
+}
+
+function detectCategory(text: string): string {
+  if (text.includes('리모컨') || text.includes('tv') || text.includes('포커스')) return 'TV리모컨규칙';
+  if (text.includes('버튼') || text.includes('팝업') || text.includes('토스트') || text.includes('컴포넌트')) return '컴포넌트규칙';
+  if (text.includes('순화') || text.includes('한자어') || text.includes('외래어') || text.includes('용어')) return '순화어/사전';
+  if (text.includes('어조') || text.includes('톤') || text.includes('해요체') || text.includes('어미')) return '어조/어미';
+  if (text.includes('능동') || text.includes('피동') || text.includes('고객 중심')) return '고객중심표현';
+  return '일반원칙';
+}
+
 /**
  * Parses raw text, markdown, or text-extracted documents into structured GuideChunks
  */
@@ -18,8 +52,11 @@ export function chunkLanguageGuideText(
   rawText: string,
   options: ChunkingOptions
 ): GuideChunk[] {
+  if (!rawText || !rawText.trim()) return [];
+
   const chunks: GuideChunk[] = [];
   const lines = rawText.split(/\r?\n/);
+  let chunkIndex = 1;
 
   let currentRuleId = '';
   let currentTitle = '';
@@ -30,21 +67,31 @@ export function chunkLanguageGuideText(
   let currentRecommended = '';
   let currentBefore = '';
   let currentAfter = '';
-  let chunkIndex = 1;
 
-  const flushCurrentChunk = () => {
-    if (!currentTitle.trim() && currentDescLines.length === 0) return;
+  const pushChunk = (data: {
+    ruleId?: string;
+    title: string;
+    description: string;
+    category?: string;
+    componentType?: string;
+    prohibited?: string;
+    recommended?: string;
+    before?: string;
+    after?: string;
+  }) => {
+    const ruleId = data.ruleId || `R-${String(chunkIndex).padStart(3, '0')}`;
+    const category = data.category || currentCategory || options.defaultCategory || '일반원칙';
+    const componentType = data.componentType || currentComponent || options.componentType || 'all';
+    const prohibited = cleanRuleText(data.prohibited || data.before || '');
+    const recommended = cleanRuleText(data.recommended || data.after || '');
+    const before = cleanRuleText(data.before || data.prohibited || '');
+    const after = cleanRuleText(data.after || data.recommended || '');
 
-    const fullDesc = currentDescLines.join(' ').trim();
-    const ruleId = currentRuleId || `R-${String(chunkIndex).padStart(3, '0')}`;
-    const title = currentTitle || `규칙 ${chunkIndex}`;
-
-    // Extract keywords
     const keywords = new Set<string>();
-    [ruleId, title, currentCategory, currentComponent, currentProhibited, currentRecommended]
+    [ruleId, data.title, category, componentType, prohibited, recommended, before, after]
       .filter(Boolean)
       .forEach((s) => {
-        s.split(/[\s,·/()[\]]+/).forEach((word) => {
+        s.split(/[\s,·/()[\]'"`]+/).forEach((word) => {
           if (word.length >= 2) keywords.add(word);
         });
       });
@@ -53,19 +100,39 @@ export function chunkLanguageGuideText(
       id: `chunk-${options.guideId}-${ruleId}-${chunkIndex}`,
       guideId: options.guideId,
       ruleId,
-      componentType: currentComponent,
-      category: currentCategory,
-      title,
-      description: fullDesc || title,
-      prohibitedPattern: currentProhibited || currentBefore,
-      recommendedPattern: currentRecommended || currentAfter,
-      beforeExample: currentBefore || currentProhibited,
-      afterExample: currentAfter || currentRecommended,
+      componentType,
+      category,
+      title: data.title,
+      description: data.description || data.title,
+      prohibitedPattern: prohibited,
+      recommendedPattern: recommended,
+      beforeExample: before,
+      afterExample: after,
       keywords: Array.from(keywords),
       createdAt: Date.now(),
     });
 
     chunkIndex++;
+  };
+
+  const flushCurrentChunk = () => {
+    if (!currentTitle.trim() && currentDescLines.length === 0 && !currentProhibited && !currentRecommended) {
+      return;
+    }
+
+    const fullDesc = currentDescLines.join(' ').trim();
+    pushChunk({
+      ruleId: currentRuleId,
+      title: currentTitle || (currentProhibited && currentRecommended ? `${currentProhibited} -> ${currentRecommended}` : `규칙 ${chunkIndex}`),
+      description: fullDesc || currentTitle || '사내 언어가이드 세부 규정',
+      category: currentCategory,
+      componentType: currentComponent,
+      prohibited: currentProhibited,
+      recommended: currentRecommended,
+      before: currentBefore,
+      after: currentAfter,
+    });
+
     currentRuleId = '';
     currentTitle = '';
     currentDescLines = [];
@@ -76,79 +143,173 @@ export function chunkLanguageGuideText(
   };
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+    const rawLine = lines[i];
+    const line = rawLine.trim();
     if (!line) {
-      // Empty line could indicate paragraph boundary
-      if (currentDescLines.length > 3) {
+      if (currentDescLines.length > 2 || currentBefore || currentProhibited) {
         flushCurrentChunk();
       }
       continue;
     }
 
-    // Check for Rule ID pattern e.g., [W-201], W-201, # W-201, 1. 규칙명
-    const ruleIdMatch = line.match(/^#{1,4}\s*\[?([A-Z]-\d{3})\]?\s*(.*)$/i) ||
-                        line.match(/^\[([A-Z]-\d{3})\]\s*(.*)$/i) ||
-                        line.match(/^([A-Z]-\d{3})[:.\s]+(.*)$/i);
+    // 1. Table row parser: | 기존/지양/Before | 권장/개선/After | (이유/설명)? |
+    if (line.startsWith('|') && line.endsWith('|')) {
+      const cells = line
+        .split('|')
+        .map((c) => c.trim())
+        .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
+
+      if (cells.length >= 2 && !cells[0].includes('---') && !cells[0].includes('기존') && !cells[0].includes('지양') && !cells[0].includes('Before')) {
+        const col1 = cleanRuleText(cells[0]);
+        const col2 = cleanRuleText(cells[1]);
+        const col3 = cells[2] ? cleanRuleText(cells[2]) : '';
+
+        if (col1 && col2 && col1 !== col2) {
+          const comp = detectComponentType(`${col1} ${col2} ${col3}`);
+          const cat = detectCategory(`${col1} ${col2} ${col3}`);
+          pushChunk({
+            title: `[표 규정] ${col1} -> ${col2}`,
+            description: col3 || `${col1} 대신 ${col2} 표기를 권장합니다.`,
+            prohibited: col1,
+            recommended: col2,
+            before: col1,
+            after: col2,
+            category: cat,
+            componentType: comp,
+          });
+          continue;
+        }
+      }
+    }
+
+    // 2. Sentences with "~는 ~로 변경/수정/바꿈/전환/통일/개선"
+    // e.g. "리모컨 방향키로 포커스를 이동하여 선택하십시오.는 리모컨 방향키로 옮겨서 선택해 주세요.로 변경"
+    // e.g. "'예약해주세요'는 '예약하기'로 변경"
+    const changeVerbMatch = line.match(
+      /^(?:[-*•\d.)\s]*)(?:['"“‘]?([가-힣\w\s.,!?-]+?)['"”’]?(?:는|은|를|을))\s*['"“‘]?([가-힣\w\s.,!?-]+?)['"”’]?(?:로|으로)\s*(?:변경|수정|바꿈|전환|통일|개선|권장|제시|사용|작성)(?:합니다|한다|함|됨|\.|!|$)/
+    );
+    if (changeVerbMatch) {
+      const fromPart = cleanRuleText(changeVerbMatch[1]);
+      const toPart = cleanRuleText(changeVerbMatch[2]);
+      if (fromPart && toPart && fromPart !== toPart) {
+        flushCurrentChunk();
+        const comp = detectComponentType(`${fromPart} ${toPart} ${line}`);
+        const cat = detectCategory(`${fromPart} ${toPart} ${line}`);
+        pushChunk({
+          title: `${fromPart} -> ${toPart} 변경`,
+          description: line,
+          prohibited: fromPart,
+          recommended: toPart,
+          before: fromPart,
+          after: toPart,
+          category: cat,
+          componentType: comp,
+        });
+        continue;
+      }
+    }
+
+    // 3. Arrow notation e.g., "A -> B", "A → B", "A => B"
+    const arrowMatch = line.match(
+      /^(?:[-*•\d.)\s]*)['"“‘]?([가-힣\w\s.,!?~-]+?)['"”’]?\s*(?:->|→|=>)\s*['"“‘]?([가-힣\w\s.,!?~-]+?)['"”’]?(?:\s*\((.*?)\))?$/
+    );
+    if (arrowMatch) {
+      const fromPart = cleanRuleText(arrowMatch[1]);
+      const toPart = cleanRuleText(arrowMatch[2]);
+      const note = arrowMatch[3] ? cleanRuleText(arrowMatch[3]) : '';
+      if (fromPart && toPart && fromPart !== toPart) {
+        flushCurrentChunk();
+        const comp = detectComponentType(`${fromPart} ${toPart} ${note}`);
+        const cat = detectCategory(`${fromPart} ${toPart} ${note}`);
+        pushChunk({
+          title: `${fromPart} -> ${toPart}`,
+          description: note || `${fromPart} 대신 ${toPart} 권장`,
+          prohibited: fromPart,
+          recommended: toPart,
+          before: fromPart,
+          after: toPart,
+          category: cat,
+          componentType: comp,
+        });
+        continue;
+      }
+    }
+
+    // 4. "A 대신 B (사용/권장/통일)"
+    const insteadMatch = line.match(
+      /^(?:[-*•\d.)\s]*)['"“‘]?([가-힣\w\s.,!?~-]+?)['"”’]?\s*대신\s*['"“‘]?([가-힣\w\s.,!?~-]+?)['"”’]?\s*(?:사용|권장|통일|적용|제시)(?:합니다|한다|함|\.|!|$)/
+    );
+    if (insteadMatch) {
+      const fromPart = cleanRuleText(insteadMatch[1]);
+      const toPart = cleanRuleText(insteadMatch[2]);
+      if (fromPart && toPart && fromPart !== toPart) {
+        flushCurrentChunk();
+        const comp = detectComponentType(`${fromPart} ${toPart} ${line}`);
+        const cat = detectCategory(`${fromPart} ${toPart} ${line}`);
+        pushChunk({
+          title: `${fromPart} 대신 ${toPart}`,
+          description: line,
+          prohibited: fromPart,
+          recommended: toPart,
+          before: fromPart,
+          after: toPart,
+          category: cat,
+          componentType: comp,
+        });
+        continue;
+      }
+    }
+
+    // 5. Check for Rule ID pattern e.g., [W-201], W-201, # W-201, 1. 규칙명
+    const ruleIdMatch =
+      line.match(/^#{1,4}\s*\[?([A-Z]-\d{3})\]?\s*(.*)$/i) ||
+      line.match(/^\[([A-Z]-\d{3})\]\s*(.*)$/i) ||
+      line.match(/^([A-Z]-\d{3})[:.\s]+(.*)$/i);
 
     if (ruleIdMatch) {
       flushCurrentChunk();
       currentRuleId = ruleIdMatch[1].toUpperCase();
       currentTitle = ruleIdMatch[2].trim() || currentRuleId;
-
-      // Auto detect component from Rule ID
-      if (currentRuleId.startsWith('W-2')) {
-        currentCategory = '컴포넌트규칙';
-        if (currentRuleId === 'W-201') currentComponent = 'button';
-        else if (currentRuleId === 'W-202') currentComponent = 'popup';
-        else if (currentRuleId === 'W-203') currentComponent = 'toast';
-        else if (currentRuleId === 'W-205') currentComponent = 'bottom_sheet';
-        else if (currentRuleId === 'W-206') currentComponent = 'label';
-        else if (currentRuleId === 'W-207') currentComponent = 'tooltip';
-        else if (currentRuleId === 'W-208') currentComponent = 'notice_error';
-        else if (currentRuleId === 'W-209') currentComponent = 'precaution';
-      } else if (currentRuleId.startsWith('W-3')) {
-        currentCategory = '순화어/사전';
-      }
+      currentCategory = detectCategory(`${currentRuleId} ${currentTitle}`);
+      currentComponent = detectComponentType(`${currentRuleId} ${currentTitle}`);
       continue;
     }
 
-    // Check for Section Header (Markdown #, ##, ### or 【】)
+    // 6. Section Header (Markdown #, ##, ### or 【】)
     const headerMatch = line.match(/^#{1,3}\s+(.+)$/) || line.match(/^【(.+)】$/);
     if (headerMatch) {
       flushCurrentChunk();
       currentTitle = headerMatch[1].trim();
+      currentCategory = detectCategory(currentTitle);
+      currentComponent = detectComponentType(currentTitle);
       continue;
     }
 
-    // Check for Prohibited / Bad Example pattern
-    const badMatch = line.match(/^(?:지양|금지|Bad|X|X표시|피해야할|오류)\s*[:：\-]\s*(.*)$/i);
+    // 7. Prohibited / Bad / AS-IS pattern
+    const badMatch = line.match(
+      /^(?:지양|금지|Bad|X|X표시|피해야\s*할|오류|기존|AS-IS|As-Is|수정\s*전|Before)\s*[:：\-]\s*(.*)$/i
+    );
     if (badMatch) {
-      currentProhibited = badMatch[1].trim();
-      currentBefore = badMatch[1].trim();
+      currentProhibited = cleanRuleText(badMatch[1]);
+      currentBefore = currentProhibited;
       continue;
     }
 
-    // Check for Recommended / Good Example pattern
-    const goodMatch = line.match(/^(?:권장|추천|Good|O|바른표현|개선안)\s*[:：\-]\s*(.*)$/i);
+    // 8. Recommended / Good / TO-BE pattern
+    const goodMatch = line.match(
+      /^(?:권장|추천|Good|O|바른\s*표현|개선안|개선|TO-BE|To-Be|수정\s*후|After|변경|적용)\s*[:：\-]\s*(.*)$/i
+    );
     if (goodMatch) {
-      currentRecommended = goodMatch[1].trim();
-      currentAfter = goodMatch[1].trim();
+      currentRecommended = cleanRuleText(goodMatch[1]);
+      currentAfter = currentRecommended;
+      // If we already have before/after pair, flush immediately
+      if (currentBefore && currentAfter) {
+        flushCurrentChunk();
+      }
       continue;
     }
 
-    // Arrow notation e.g., 금일 -> 오늘
-    const arrowMatch = line.match(/^([가-힣\w\s]+)\s*(?:->|→|=>)\s*([가-힣\w\s]+)(?:\s*\((.*)\))?$/);
-    if (arrowMatch) {
-      flushCurrentChunk();
-      currentTitle = `${arrowMatch[1].trim()} 순화`;
-      currentProhibited = arrowMatch[1].trim();
-      currentRecommended = arrowMatch[2].trim();
-      if (arrowMatch[3]) currentDescLines.push(arrowMatch[3].trim());
-      flushCurrentChunk();
-      continue;
-    }
-
-    // Regular descriptive content
+    // 9. Regular descriptive line
     currentDescLines.push(line);
   }
 
@@ -159,17 +320,31 @@ export function chunkLanguageGuideText(
     const paragraphs = rawText.split(/\n\s*\n/).filter((p) => p.trim());
     paragraphs.forEach((p, idx) => {
       const pLines = p.trim().split('\n');
-      const title = pLines[0].slice(0, 40);
+      const title = pLines[0].slice(0, 50);
+      const comp = detectComponentType(p);
+      const cat = detectCategory(p);
+
+      // Try finding any embedded arrow or change pattern in the paragraph
+      const arrowInside = p.match(/['"“‘]?([가-힣\w\s.,!?-]{2,30})['"”’]?\s*(?:->|→|=>)\s*['"“‘]?([가-힣\w\s.,!?-]{2,30})['"”’]?/);
+      let prob = '';
+      let reco = '';
+      if (arrowInside) {
+        prob = cleanRuleText(arrowInside[1]);
+        reco = cleanRuleText(arrowInside[2]);
+      }
+
       chunks.push({
         id: `chunk-${options.guideId}-p-${idx + 1}`,
         guideId: options.guideId,
         ruleId: `P-${idx + 1}`,
-        componentType: options.componentType || 'all',
-        category: options.defaultCategory || '일반원칙',
+        componentType: comp,
+        category: cat,
         title,
         description: p.trim(),
-        beforeExample: '',
-        afterExample: '',
+        prohibitedPattern: prob,
+        recommendedPattern: reco,
+        beforeExample: prob,
+        afterExample: reco,
         keywords: title.split(/\s+/).filter((w) => w.length >= 2),
         createdAt: Date.now(),
       });

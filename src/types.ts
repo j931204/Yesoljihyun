@@ -185,6 +185,7 @@ export interface UploadedGuideVersion {
   isActive: boolean;
   isInitialVersion?: boolean; // 1차 버전
   fileData?: string; // base64 if uploaded by user
+  rawContent?: string; // Full extracted text or direct text input of the guide
   summary: string;
   changelog?: string;
   extractedRules: {

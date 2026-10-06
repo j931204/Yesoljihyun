@@ -55,6 +55,10 @@ export interface LocalInspectionResult {
 
 type ProgressListener = (report: LLMProgressReport) => void;
 
+function cleanPunct(str: string): string {
+  return (str || '').replace(/[.!?~,'"`·\s]+$/g, '').trim();
+}
+
 class LocalLLMManager {
   private static instance: LocalLLMManager | null = null;
   private engine: MLCEngineInterface | null = null;
@@ -77,7 +81,6 @@ class LocalLLMManager {
 
   public subscribe(listener: ProgressListener): () => void {
     this.listeners.add(listener);
-    // Immediately emit current state
     listener(this.getProgressReport());
     return () => {
       this.listeners.delete(listener);
@@ -232,38 +235,52 @@ class LocalLLMManager {
       pastCases,
     } = params;
 
+    // Detect if input sentence mentions button or is a button phrase
+    let effectiveComponentType = componentType;
+    if (
+      inputSentence.includes('버튼') ||
+      inputSentence.startsWith('[버튼') ||
+      inputSentence.endsWith('하기') ||
+      inputSentence.includes('예약해주세요') ||
+      inputSentence.includes('신청해주세요') ||
+      inputSentence.includes('결제해주세요')
+    ) {
+      if (componentType === 'general' || !componentType) {
+        effectiveComponentType = 'button';
+      }
+    }
+
     // 1. RAG Search: Retrieve Top 5~10 most relevant guide rules
     const relevantRules = searchRelevantGuideRules(inputSentence, allChunks, {
-      componentType,
-      limit: 7,
+      componentType: effectiveComponentType,
+      limit: 8,
     });
 
     // 2. Few-shot Selection: Retrieve top 2~3 past correction cases
     const selectedPastCases = pastCases.slice(0, 3);
-
     const appliedRules = relevantRules.map((r) => r.chunk.title);
 
-    // 3. Check if Local LLM is available, otherwise run high-precision client heuristic fallback
+    // 3. If Local LLM engine is not initialized or still downloading, run high-precision client heuristic rule engine
     if (!this.engine || this.stage !== 'ready') {
       console.log('[LocalLLM] Engine not ready, running client-side RAG heuristic engine.');
       return this.runClientHeuristicFallback({
         inputSentence,
         relevantRules,
         selectedPastCases,
-        componentType,
+        componentType: effectiveComponentType,
         toneLevel,
-        modelName: 'Client Heuristic Rule Engine (온디바이스)',
+        modelName: 'Client RAG Rule Engine (온디바이스)',
         allChunks,
       });
     }
 
-    // 4. Build Prompts
+    // 4. Build Prompts for WebLLM
     const systemPrompt = buildSystemPrompt(guideTitle, guideVersion);
     const userPrompt = buildUserPrompt({
       inputSentence,
       guideTitle,
       guideVersion,
-      componentType,
+      componentType: effectiveComponentType,
       service,
       context,
       toneLevel,
@@ -293,27 +310,32 @@ class LocalLLMManager {
       const content = completion.choices[0]?.message?.content || '{}';
       const parsed = this.parseJsonSafely(content);
 
+      // Verify and guarantee guide enforcement
+      const heuristicValidation = this.runClientHeuristicFallback({
+        inputSentence,
+        relevantRules,
+        selectedPastCases,
+        componentType: effectiveComponentType,
+        toneLevel,
+        modelName: this.currentModelId,
+        allChunks,
+      });
+
       if (parsed && typeof parsed.needsRevision === 'boolean') {
         let finalRevised = parsed.revised || inputSentence;
         let finalViolations = Array.isArray(parsed.violations) ? parsed.violations : [];
         let finalNeedsRevision = parsed.needsRevision;
 
-        // Safety verification for button component: Never keep polite sentence endings like '~해주세요'
-        if (componentType === 'button' && (finalRevised.includes('해주세요') || finalRevised.includes('해 주세요') || finalRevised.includes('바랍니다'))) {
-          const fallbackCheck = this.runClientHeuristicFallback({
-            inputSentence,
-            relevantRules,
-            selectedPastCases,
-            componentType,
-            toneLevel,
-            modelName: this.currentModelId,
-            allChunks,
+        // If heuristic found guide violations that LLM missed (e.g. uploaded guide exact match), enforce heuristic
+        if (heuristicValidation.needsRevision) {
+          finalRevised = heuristicValidation.revised;
+          finalNeedsRevision = true;
+          const existingRuleTitles = new Set(finalViolations.map((v) => v.rule));
+          heuristicValidation.violations.forEach((hv) => {
+            if (!existingRuleTitles.has(hv.rule)) {
+              finalViolations.unshift(hv);
+            }
           });
-          if (fallbackCheck.needsRevision) {
-            finalRevised = fallbackCheck.revised;
-            finalViolations = fallbackCheck.violations;
-            finalNeedsRevision = true;
-          }
         }
 
         return {
@@ -321,7 +343,7 @@ class LocalLLMManager {
           original: parsed.original || inputSentence,
           revised: finalRevised,
           violations: finalViolations,
-          summary: parsed.summary || '사내 언어가이드 기준 정밀 교정이 완료되었습니다.',
+          summary: parsed.summary || heuristicValidation.summary || '사내 언어가이드 기준 정밀 교정이 완료되었습니다.',
           appliedRules,
           relevantChunks: relevantRules,
           usedPastCases: selectedPastCases,
@@ -330,16 +352,8 @@ class LocalLLMManager {
         };
       }
 
-      // If LLM returned invalid JSON, fall back smoothly
-      return this.runClientHeuristicFallback({
-        inputSentence,
-        relevantRules,
-        selectedPastCases,
-        componentType,
-        toneLevel,
-        modelName: `${this.currentModelId} (JSON 파싱 보정)`,
-        allChunks,
-      });
+      // If LLM returned unparsable response, use heuristic output
+      return heuristicValidation;
     } catch (err: any) {
       console.error('[LocalLLM] Inference error, falling back to local heuristic:', err);
       this.stage = 'ready';
@@ -348,7 +362,7 @@ class LocalLLMManager {
         inputSentence,
         relevantRules,
         selectedPastCases,
-        componentType,
+        componentType: effectiveComponentType,
         toneLevel,
         modelName: 'Client RAG Rule Engine (Fallback)',
         allChunks,
@@ -398,11 +412,29 @@ class LocalLLMManager {
     let revised = inputSentence.trim();
     const violations: LocalInspectionViolation[] = [];
 
+    // Strip button quotes / prefixes if present e.g. 버튼 "예약해주세요" or [버튼] 예약해주세요
+    let prefix = '';
+    const prefixMatch = revised.match(/^(\[(?:버튼|확인\s*버튼|취소\s*버튼|CTA|Action)\]|\b버튼\b\s*[:：]?\s*)(["'“‘]?)(.*?)(["'”’]?)$/i);
+    let innerText = revised;
+    if (prefixMatch) {
+      prefix = prefixMatch[1];
+      innerText = prefixMatch[3].trim();
+    } else {
+      const quoteMatch = revised.match(/^["'“‘](.*?)["'”’]$/);
+      if (quoteMatch) {
+        innerText = quoteMatch[1].trim();
+      }
+    }
+
     // 0. Check Past Correction Cases from IndexedDB (Few-Shot memory)
     if (selectedPastCases && selectedPastCases.length > 0) {
       for (const pc of selectedPastCases) {
-        if (pc.original && pc.original.trim() === inputSentence.trim() && pc.finalRevision) {
-          revised = pc.finalRevision;
+        if (
+          pc.original &&
+          (pc.original.trim() === inputSentence.trim() || pc.original.trim() === innerText) &&
+          pc.finalRevision
+        ) {
+          revised = prefix ? `${prefix} ${pc.finalRevision}` : pc.finalRevision;
           violations.push({
             rule: `[과거 채택 학습] ${pc.appliedRules.join(', ') || '가이드 표준 준수'}`,
             originalPart: pc.original,
@@ -415,53 +447,105 @@ class LocalLLMManager {
     }
 
     // 1. DYNAMIC GUIDE RULE MATCHING (From Active Uploaded Guide Chunks & RAG)
+    // Gather all candidate chunks from uploaded guide and top search results
     const activeRuleChunks = allChunks && allChunks.length > 0 ? allChunks : relevantRules.map((r) => r.chunk);
+
     for (const chunk of activeRuleChunks) {
-      if (chunk.componentType !== 'all' && chunk.componentType !== componentType && componentType) {
-        continue;
-      }
+      // Build paired (bad, good) lists from chunk
+      const pairs: Array<{ bad: string; good: string; rule: string; reason: string }> = [];
 
-      // Check prohibitedPattern vs recommendedPattern
-      if (chunk.prohibitedPattern && chunk.recommendedPattern) {
-        const badPatterns = chunk.prohibitedPattern
-          .split(/[/,\n|]+/)
-          .map((p) => p.replace(/^[~*•\s]+/, '').replace(/[~*•\s]+$/, '').trim())
-          .filter((p) => p.length >= 2);
-
-        for (const bad of badPatterns) {
-          if (bad && revised.includes(bad)) {
-            const good = chunk.recommendedPattern.replace(/^[~*•\s]+/, '').trim();
-            violations.push({
+      // Extract from beforeExample / afterExample
+      if (chunk.beforeExample && chunk.afterExample && chunk.beforeExample !== chunk.afterExample) {
+        const befores = chunk.beforeExample.split(/[\/\n|]+/).map((b) => b.trim()).filter((b) => b.length >= 2);
+        const afters = chunk.afterExample.split(/[\/\n|]+/).map((a) => a.trim()).filter((a) => a.length >= 1);
+        if (befores.length === afters.length && befores.length > 1) {
+          befores.forEach((b, idx) => {
+            pairs.push({
+              bad: b,
+              good: afters[idx],
               rule: `[${chunk.ruleId}] ${chunk.title}`,
-              originalPart: bad,
-              suggestion: good,
-              reason: chunk.description || '사내 공식 언어가이드 표기 기준을 적용합니다.',
+              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
             });
-            revised = revised.replaceAll(bad, good);
-            break;
-          }
+          });
+        } else {
+          befores.forEach((b) => {
+            pairs.push({
+              bad: b,
+              good: afters[0] || chunk.afterExample.trim(),
+              rule: `[${chunk.ruleId}] ${chunk.title}`,
+              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
+            });
+          });
         }
       }
 
-      // Check beforeExample -> afterExample
-      if (chunk.beforeExample && chunk.afterExample && chunk.beforeExample !== chunk.afterExample) {
-        const beforeList = chunk.beforeExample
-          .split(/[/,\n|]+/)
-          .map((b) => b.trim())
-          .filter((b) => b.length >= 2);
-
-        for (const before of beforeList) {
-          if (before && revised.includes(before)) {
-            const after = chunk.afterExample.trim();
-            violations.push({
+      // Extract from prohibitedPattern / recommendedPattern
+      if (chunk.prohibitedPattern && chunk.recommendedPattern && chunk.prohibitedPattern !== chunk.recommendedPattern) {
+        const probs = chunk.prohibitedPattern.split(/[\/\n|]+/).map((b) => b.trim()).filter((b) => b.length >= 2);
+        const recos = chunk.recommendedPattern.split(/[\/\n|]+/).map((a) => a.trim()).filter((a) => a.length >= 1);
+        if (probs.length === recos.length && probs.length > 1) {
+          probs.forEach((p, idx) => {
+            pairs.push({
+              bad: p,
+              good: recos[idx],
               rule: `[${chunk.ruleId}] ${chunk.title}`,
-              originalPart: before,
-              suggestion: after,
-              reason: chunk.description || '사내 공식 언어가이드 권장 표현으로 교정합니다.',
+              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
             });
-            revised = revised.replaceAll(before, after);
-            break;
-          }
+          });
+        } else {
+          probs.forEach((p) => {
+            pairs.push({
+              bad: p,
+              good: recos[0] || chunk.recommendedPattern.trim(),
+              rule: `[${chunk.ruleId}] ${chunk.title}`,
+              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
+            });
+          });
+        }
+      }
+
+      // Check each pair against revised and innerText
+      for (const pair of pairs) {
+        const badClean = cleanPunct(pair.bad);
+        const goodClean = pair.good.trim();
+        const revisedClean = cleanPunct(revised);
+        const innerClean = cleanPunct(innerText);
+
+        // Exact match (with or without punctuation)
+        if (revisedClean === badClean || innerClean === badClean) {
+          violations.push({
+            rule: pair.rule,
+            originalPart: innerText || revised,
+            suggestion: goodClean,
+            reason: pair.reason,
+          });
+          revised = prefix ? `${prefix} ${goodClean}` : goodClean;
+          break;
+        }
+
+        // Substring match
+        if (badClean.length >= 3 && revised.includes(badClean)) {
+          violations.push({
+            rule: pair.rule,
+            originalPart: badClean,
+            suggestion: goodClean,
+            reason: pair.reason,
+          });
+          revised = revised.replaceAll(badClean, goodClean);
+          break;
+        }
+
+        // Check if bad without period matches revised without period
+        if (badClean.length >= 3 && revisedClean.includes(badClean)) {
+          violations.push({
+            rule: pair.rule,
+            originalPart: badClean,
+            suggestion: goodClean,
+            reason: pair.reason,
+          });
+          const trailingPeriod = revised.endsWith('.') ? '.' : '';
+          revised = revisedClean.replace(badClean, goodClean) + (goodClean.endsWith('.') ? '' : trailingPeriod);
+          break;
         }
       }
     }
@@ -469,8 +553,10 @@ class LocalLLMManager {
     // 2. Button Component Rules (핵심: 대화체/문장형 ~해주세요 금지 -> 행동형 ~하기 권장)
     const isButton =
       componentType === 'button' ||
+      inputSentence.includes('버튼') ||
+      inputSentence.startsWith('[버튼') ||
       inputSentence.endsWith('하기') ||
-      inputSentence.endsWith('버튼');
+      prefix !== '';
 
     if (isButton) {
       // Direct high-frequency button mappings
@@ -479,41 +565,63 @@ class LocalLLMManager {
         '예약해 주세요': '예약하기',
         '예약하세요': '예약하기',
         '예약바랍니다': '예약하기',
+        '예약해 주십시오': '예약하기',
         '신청해주세요': '신청하기',
         '신청해 주세요': '신청하기',
         '신청하세요': '신청하기',
+        '신청바랍니다': '신청하기',
         '결제해주세요': '결제하기',
         '결제해 주세요': '결제하기',
+        '결제하세요': '결제하기',
+        '결제바랍니다': '결제하기',
         '확인해주세요': '확인하기',
         '확인해 주세요': '확인하기',
+        '확인하세요': '확인하기',
+        '확인바랍니다': '확인하기',
         '조회해주세요': '조회하기',
+        '조회해 주세요': '조회하기',
         '등록해주세요': '등록하기',
+        '등록해 주세요': '등록하기',
         '구매해주세요': '구매하기',
         '가입해주세요': '가입하기',
+        '가입해 주세요': '가입하기',
         '다운로드해주세요': '다운로드하기',
         '문의해주세요': '문의하기',
         '선택해주세요': '선택하기',
+        '선택해 주세요': '선택하기',
         '변경해주세요': '변경하기',
+        '변경해 주세요': '변경하기',
         '취소해주세요': '취소하기',
         '이용해주세요': '이용하기',
+        '이용해 주세요': '이용하기',
         '참여해주세요': '참여하기',
       };
 
       for (const [badBtn, goodBtn] of Object.entries(directButtonMap)) {
-        if (revised.includes(badBtn)) {
+        if (revised.includes(badBtn) || innerText.includes(badBtn)) {
+          const original = innerText.includes(badBtn) ? badBtn : revised;
           violations.push({
             rule: "[W-201] 버튼 표기 원칙 (대화체 '~해주세요' 지양, 행동형 '~하기' 권장)",
-            originalPart: badBtn,
+            originalPart: original,
             suggestion: goodBtn,
-            reason: "사내 UX Writing 가이드에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
+            reason: "사내 UX Writing 가이드(W-201)에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
           });
-          revised = revised.replaceAll(badBtn, goodBtn);
+          if (prefix) {
+            revised = `${prefix} ${goodBtn}`;
+          } else if (revised.match(/^["'“‘].*?["'”’]$/)) {
+            revised = goodBtn;
+          } else {
+            revised = revised.replaceAll(badBtn, goodBtn);
+          }
+          break;
         }
       }
 
       // Generalized regex for any Korean verb in buttons: [어간] + 해 주세요 / 해주세요 / 하세요 / 바랍니다
-      const cleanBtn = revised.replace(/[.!?~]+$/, '').trim();
-      const politeButtonMatch = cleanBtn.match(/^(.*?)(?:을|를)?\s*(?:해\s*주세요|해주세요|해줘|하세요|하십시오|바랍니다|해\s*바랍니다)$/);
+      const cleanBtn = cleanPunct(innerText || revised);
+      const politeButtonMatch = cleanBtn.match(
+        /^(.*?)(?:을|를)?\s*(?:해\s*주세요|해주세요|해줘|하세요|하십시오|바랍니다|해\s*바랍니다)$/
+      );
       if (politeButtonMatch) {
         const root = politeButtonMatch[1].trim();
         if (root && root !== revised) {
@@ -524,16 +632,18 @@ class LocalLLMManager {
               rule: "[W-201] 버튼 표기 원칙 (대화체 '~해주세요' 지양, 행동형 '~하기' 권장)",
               originalPart: cleanBtn,
               suggestion: suggested,
-              reason: "사내 UX Writing 가이드에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
+              reason: "사내 UX Writing 가이드(W-201)에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
             });
           }
-          revised = suggested;
+          revised = prefix ? `${prefix} ${suggested}` : suggested;
         }
       }
 
       // Check if button text has redundant filler like "버튼을 클릭하세요", "버튼을 눌러주세요"
       if (revised.includes('버튼을') && (revised.includes('눌러') || revised.includes('클릭'))) {
-        const simplified = revised.replace(/\s*버튼을\s*(?:눌러주세요|클릭하세요|클릭해 주세요|누르세요)\s*$/, '').trim();
+        const simplified = revised
+          .replace(/\s*버튼을\s*(?:눌러주세요|클릭하세요|클릭해 주세요|누르세요)\s*$/, '')
+          .trim();
         if (simplified) {
           revised = simplified.endsWith('하기') ? simplified : `${simplified}하기`;
         }
@@ -592,7 +702,7 @@ class LocalLLMManager {
       revised: needsRevision ? revised : inputSentence,
       violations,
       summary: needsRevision
-        ? `사내 언어가이드 규정(${violations.map((v) => v.rule.split(' ')[0]).join(', ') || '가이드 표준'})에 따라 불필요한 서술어와 지양 표현을 정돈하고, 가이드 권장 형태로 교정했습니다.`
+        ? `사내 언어가이드 규정(${violations.map((v) => v.rule.split(' ')[0]).join(', ') || '가이드 표준'})에 따라 지양 표현을 정돈하고, 가이드 권장 형태로 교정했습니다.`
         : '현재 사내 언어가이드 기준으로 수정이 필요한 부분이 없습니다.',
       appliedRules: relevantRules.map((r) => r.chunk.title),
       relevantChunks: relevantRules,

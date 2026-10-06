@@ -215,9 +215,9 @@ export async function seedDefaultGuideIfNeeded(): Promise<UploadedGuideVersion> 
   if (guides.length > 0) {
     const active = guides.find((g) => g.isActive) || guides[0];
     const existingChunks = await getChunksFromDB(defaultGuide.id);
-    const hasLatestRule = existingChunks.some(
-      (c) => c.prohibitedPattern?.includes('예약해주세요') || c.recommendedPattern?.includes('예약하기')
-    );
+    const hasLatestRule =
+      existingChunks.some((c) => c.ruleId === 'W-210' || c.prohibitedPattern?.includes('포커스를 이동하여')) &&
+      existingChunks.some((c) => c.prohibitedPattern?.includes('예약해주세요'));
     if (hasLatestRule) {
       return active;
     }

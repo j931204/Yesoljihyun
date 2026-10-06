@@ -121,6 +121,12 @@ export const GuidePdfUploadModal: React.FC<GuidePdfUploadModalProps> = ({
 
       const processCompletion = (base64Data?: string) => {
         const guideId = `guide-${Date.now()}`;
+        const rawContent = rawText || '';
+        const parsedChunks = chunkLanguageGuideText(rawContent, {
+          guideId,
+          defaultCategory: '사내가이드',
+        });
+
         const newGuideVersion: UploadedGuideVersion = {
           id: guideId,
           version: guideVersion.trim() || 'v0.4',
@@ -131,7 +137,8 @@ export const GuidePdfUploadModal: React.FC<GuidePdfUploadModalProps> = ({
           isActive: true,
           isInitialVersion: false,
           fileData: base64Data,
-          summary: `${guideVersion} 배포본: ${entryMode === 'text' ? '직접 입력' : selectedFile?.name} 기반으로 등록된 사내 언어 가이드 규칙`,
+          rawContent,
+          summary: `${guideVersion} 배포본: ${entryMode === 'text' ? '직접 입력' : selectedFile?.name} (총 ${parsedChunks.length}개 규칙 RAG 등록)`,
           changelog: changelog.trim(),
           extractedRules: {
             generalPrinciples: [
