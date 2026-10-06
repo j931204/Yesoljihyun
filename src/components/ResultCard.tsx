@@ -12,6 +12,9 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  CheckSquare,
+  Shield,
+  Layers,
 } from 'lucide-react';
 import {
   InspectionItemResult,
@@ -22,6 +25,7 @@ import {
   UIComponentType,
 } from '../types';
 import { SERVICES_CONFIG, DEFAULT_COMPONENT_GUIDES } from '../data/defaultGuides';
+import { computeWordDiff } from '../utils/diffUtils';
 
 interface ResultCardProps {
   item: InspectionItemResult;
@@ -51,7 +55,7 @@ export const ResultCard: React.FC<ResultCardProps> = ({
   isRefining = false,
 }) => {
   const [copiedAlt, setCopiedAlt] = useState<number | null>(null);
-  const [showDetails, setShowDetails] = useState<boolean>(false);
+  const [showDetails, setShowDetails] = useState<boolean>(true); // default open to show rules and diff
   const [showChat, setShowChat] = useState<boolean>(false);
   const [chatInput, setChatInput] = useState<string>('');
   const [customEditing, setCustomEditing] = useState<boolean>(false);
@@ -83,27 +87,14 @@ export const ResultCard: React.FC<ResultCardProps> = ({
     await onRefineChat(item.id, msg);
   };
 
-  // Derive detected term replacements if available
-  const primaryViolation = item.violations?.[0];
-  let categoryLabel = '표현 개선';
-  let targetWord = '';
-  let replacedWord = '';
+  const handleSaveCustomEdit = () => {
+    if (!customText.trim()) return;
+    onAdopt(item.id, 'custom', customText.trim());
+    setCustomEditing(false);
+  };
 
-  if (primaryViolation) {
-    const textToCheck = `${primaryViolation.category || ''} ${primaryViolation.title || ''} ${primaryViolation.description || ''}`;
-    if (textToCheck.includes('한자')) categoryLabel = '한자어';
-    else if (textToCheck.includes('외래') || textToCheck.includes('외국')) categoryLabel = '외국어·외래어';
-    else if (textToCheck.includes('전문')) categoryLabel = '전문용어';
-    else if (textToCheck.includes('어미') || textToCheck.includes('문법')) categoryLabel = '어미·문법';
-    else if (textToCheck.includes('글자') || originalCharsNoSpace > charLimit) categoryLabel = '글자 수 초과';
-
-    targetWord = primaryViolation.violatedTextPart || item.originalText;
-    replacedWord = item.alt1.text;
-  } else if (originalCharsNoSpace > charLimit) {
-    categoryLabel = '글자 수 초과';
-    targetWord = `${originalCharsNoSpace}자`;
-    replacedWord = `${alt1CharsNoSpace}자 권장`;
-  }
+  // Compute visual word-level diff between original and recommended
+  const diffResult = computeWordDiff(item.originalText, item.alt1.text);
 
   return (
     <div
@@ -113,7 +104,7 @@ export const ResultCard: React.FC<ResultCardProps> = ({
       {/* 1. Header: Number + Original Text + Adoption Status */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
         <div className="flex items-start sm:items-center space-x-3">
-          <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-slate-900 text-white text-xs font-bold shrink-0">
+          <span className="flex items-center justify-center w-7 h-7 rounded-lg bg-[#050099] text-white text-xs font-bold shrink-0">
             {index + 1}
           </span>
           <div>
@@ -137,171 +128,154 @@ export const ResultCard: React.FC<ResultCardProps> = ({
             <CheckCircle2 className="w-4 h-4 text-emerald-600" />
             <span>
               {item.selectedAlt === 1
-                ? '대안 1 채택'
+                ? '추천안 채택 완료'
                 : item.selectedAlt === 2
-                ? '대안 2 채택'
-                : '직접 수정 채택'}
+                ? '대안 2 채택 완료'
+                : '사용자 직접 수정 반영'}
             </span>
           </div>
         )}
       </div>
 
-      {/* 2. Key Term Substitution Row (이미지 속 깔끔한 대체 표현 행) */}
-      {(primaryViolation || targetWord) && (
-        <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200/80 flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="px-2.5 py-1 rounded-md bg-rose-50 border border-rose-200 text-rose-700 font-bold">
-              {categoryLabel}
-            </span>
-            <span className="font-bold text-slate-700 bg-white px-2.5 py-1 rounded-md border border-slate-200 line-through text-slate-500">
-              {targetWord}
-            </span>
-            <span className="text-slate-400 font-bold text-sm">→</span>
-            <span className="font-extrabold text-[#050099] bg-[#050099]/10 px-3 py-1 rounded-md border border-[#050099]/20">
-              {replacedWord}
-            </span>
-          </div>
-          <span className="text-[11px] font-medium text-slate-600 shrink-0">
-            표준 고객언어 가이드
+      {/* 2. Visual Diff Section (요구사항 8: 변경된 부분 diff 강조) */}
+      <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+        <div className="flex items-center justify-between text-xs font-extrabold text-slate-700">
+          <span className="flex items-center space-x-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#050099]"></span>
+            <span>교정 비교 (Diff)</span>
+          </span>
+          <span className="text-[11px] text-slate-500 font-normal">
+            적색 취소선: 지양 표현 / 녹색 굵은 글씨: 가이드 권장어
           </span>
         </div>
-      )}
 
-      {/* 3. Suggested Alternatives (대안 1 & 대안 2 제안 카드) */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 pt-1">
-        {/* Alternative 1: 표준 추천형 */}
-        <div
-          className={`p-4 rounded-xl border transition-all flex flex-col justify-between ${
-            item.selectedAlt === 1
-              ? 'border-[#050099] bg-[#050099]/5 ring-2 ring-[#050099]/20'
-              : 'border-slate-200 bg-white hover:border-slate-300'
-          }`}
-        >
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-[#050099] flex items-center space-x-1.5">
-                <span className="w-2 h-2 rounded-full bg-[#050099]" />
-                <span>대안 1: 표준 권장형</span>
-              </span>
-              <span className="text-[11px] font-mono text-slate-500">
-                공백제외 {alt1CharsNoSpace}자
-              </span>
+        {/* Diff Display Box */}
+        <div className="space-y-1.5 text-xs sm:text-sm">
+          <div className="flex items-baseline space-x-2 bg-white p-2.5 rounded-lg border border-slate-200">
+            <span className="text-[11px] font-bold text-slate-500 w-10 shrink-0">기존</span>
+            <div className="text-slate-800 leading-relaxed font-medium">
+              {diffResult.parts.map((p, idx) => {
+                if (p.type === 'removed') {
+                  return (
+                    <span
+                      key={idx}
+                      className="bg-rose-100 text-rose-800 line-through px-1 py-0.5 rounded font-bold mx-0.5"
+                    >
+                      {p.text}
+                    </span>
+                  );
+                }
+                if (p.type === 'same') {
+                  return <span key={idx}>{p.text}</span>;
+                }
+                return null;
+              })}
             </div>
-
-            <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-sm font-extrabold text-[#050099] leading-relaxed">
-              {item.alt1.text}
-            </div>
-
-            <p className="text-[11px] text-slate-600 leading-snug">
-              {item.alt1.highlights || '가이드 표준 용어 및 권장 어미를 적용한 문구입니다.'}
-            </p>
           </div>
 
-          <div className="flex items-center justify-end gap-2 pt-3 mt-2 border-t border-slate-100">
-            <button
-              type="button"
-              id={`copy-alt1-${item.id}`}
-              onClick={() => handleCopy(item.alt1.text, 1)}
-              className="text-xs text-slate-600 hover:text-[#050099] px-2.5 py-1.5 rounded-lg hover:bg-slate-100 transition-all cursor-pointer whitespace-nowrap"
-            >
-              {copiedAlt === 1 ? '복사됨!' : '문구 복사'}
-            </button>
-
-            <button
-              type="button"
-              id={`adopt-alt1-${item.id}`}
-              onClick={() => onAdopt(item.id, 1)}
-              className={`text-xs px-3.5 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
-                item.selectedAlt === 1
-                  ? 'bg-[#050099] text-white shadow-xs'
-                  : 'bg-[#050099]/10 text-[#050099] hover:bg-[#050099]/20 border border-[#050099]/20'
-              }`}
-            >
-              <span>{item.selectedAlt === 1 ? '채택 완료' : '이 제안문구 채택'}</span>
-            </button>
+          <div className="flex items-baseline space-x-2 bg-white p-2.5 rounded-lg border border-emerald-200 bg-emerald-50/30">
+            <span className="text-[11px] font-bold text-emerald-700 w-10 shrink-0">추천</span>
+            <div className="text-slate-900 leading-relaxed font-bold">
+              {diffResult.parts.map((p, idx) => {
+                if (p.type === 'added') {
+                  return (
+                    <span
+                      key={idx}
+                      className="bg-emerald-100 text-emerald-900 px-1 py-0.5 rounded font-extrabold mx-0.5"
+                    >
+                      {p.text}
+                    </span>
+                  );
+                }
+                if (p.type === 'same') {
+                  return <span key={idx}>{p.text}</span>;
+                }
+                return null;
+              })}
+            </div>
           </div>
         </div>
 
-        {/* Alternative 2: 간결·친절형 */}
-        <div
-          className={`p-4 rounded-xl border transition-all flex flex-col justify-between ${
-            item.selectedAlt === 2
-              ? 'border-[#050099] bg-[#050099]/5 ring-2 ring-[#050099]/20'
-              : 'border-slate-200 bg-white hover:border-slate-300'
-          }`}
-        >
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-[#050099] flex items-center space-x-1.5">
-                <span className="w-2 h-2 rounded-full bg-[#050099]" />
-                <span>대안 2: 간결·친절형</span>
-              </span>
-              <span className="text-[11px] font-mono text-slate-500">
-                공백제외 {alt2CharsNoSpace}자
-              </span>
+        {/* Applied Rules & Reasons List (요구사항 8) */}
+        {item.violations && item.violations.length > 0 && (
+          <div className="pt-2 border-t border-slate-200/80 space-y-1.5">
+            <span className="text-[11px] font-extrabold text-slate-700 block">
+              적용된 언어가이드 규칙 및 변경 이유:
+            </span>
+            <div className="space-y-1">
+              {item.violations.map((v, i) => (
+                <div
+                  key={i}
+                  className="p-2 rounded-lg bg-white border border-slate-200 text-[11.5px] space-y-0.5"
+                >
+                  <div className="flex items-center space-x-2">
+                    <span className="font-extrabold text-[#050099] bg-[#050099]/10 px-1.5 py-0.2 rounded text-[10.5px]">
+                      적용 규칙
+                    </span>
+                    <span className="font-bold text-slate-900">{v.title}</span>
+                  </div>
+                  <div className="text-slate-600 pl-1 leading-snug">
+                    <strong className="text-slate-700">이유:</strong> {v.description}
+                  </div>
+                </div>
+              ))}
             </div>
-
-            <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-sm font-extrabold text-[#050099] leading-relaxed">
-              {item.alt2.text}
-            </div>
-
-            <p className="text-[11px] text-slate-600 leading-snug">
-              {item.alt2.highlights || '사용자 친화적이고 직관적인 표현으로 축약한 문구입니다.'}
-            </p>
           </div>
-
-          <div className="flex items-center justify-end gap-2 pt-3 mt-2 border-t border-slate-100">
-            <button
-              type="button"
-              id={`copy-alt2-${item.id}`}
-              onClick={() => handleCopy(item.alt2.text, 2)}
-              className="text-xs text-slate-600 hover:text-[#050099] px-2.5 py-1.5 rounded-lg hover:bg-slate-100 transition-all cursor-pointer whitespace-nowrap"
-            >
-              {copiedAlt === 2 ? '복사됨!' : '문구 복사'}
-            </button>
-
-            <button
-              type="button"
-              id={`adopt-alt2-${item.id}`}
-              onClick={() => onAdopt(item.id, 2)}
-              className={`text-xs px-3.5 py-1.5 rounded-lg font-bold transition-all cursor-pointer whitespace-nowrap ${
-                item.selectedAlt === 2
-                  ? 'bg-[#050099] text-white shadow-xs'
-                  : 'bg-[#050099]/10 text-[#050099] hover:bg-[#050099]/20 border border-[#050099]/20'
-              }`}
-            >
-              <span>{item.selectedAlt === 2 ? '채택 완료' : '이 제안문구 채택'}</span>
-            </button>
-          </div>
-        </div>
+        )}
       </div>
 
-      {/* 4. Bottom Utility Toolbar (세부 근거 / 직접 수정 / 대화형 재수정 토글) */}
-      <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 text-xs">
-        <div className="flex items-center space-x-3">
+      {/* 3. Primary User Action Toolbar (요구사항 9: 추천안 적용 / 직접 수정 / 원문 유지) */}
+      <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Action 1: 추천안 적용 */}
           <button
             type="button"
-            onClick={() => setShowDetails(!showDetails)}
-            className="text-slate-500 hover:text-slate-800 font-bold flex items-center space-x-1 cursor-pointer"
+            id={`btn-adopt-rec-${item.id}`}
+            onClick={() => onAdopt(item.id, 1)}
+            className={`px-4 py-2 rounded-xl text-xs font-extrabold transition-all cursor-pointer flex items-center space-x-1.5 whitespace-nowrap shadow-xs ${
+              item.selectedAlt === 1
+                ? 'bg-emerald-600 text-white'
+                : 'bg-[#050099] hover:bg-[#040080] text-white'
+            }`}
           >
-            <span>{showDetails ? '세부 가이드 접기' : '세부 가이드 및 판정 근거'}</span>
-            {showDetails ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            <span>{item.selectedAlt === 1 ? '추천안 채택됨' : '추천안 적용 (학습 반영)'}</span>
           </button>
 
+          {/* Action 2: 직접 수정 */}
           <button
             type="button"
+            id={`btn-custom-edit-${item.id}`}
             onClick={() => setCustomEditing(!customEditing)}
-            className="text-slate-500 hover:text-[#050099] font-bold cursor-pointer"
+            className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 whitespace-nowrap ${
+              customEditing || item.selectedAlt === 'custom'
+                ? 'bg-blue-100 text-[#050099] border border-[#050099]'
+                : 'bg-white hover:bg-slate-100 text-slate-800 border border-slate-300'
+            }`}
           >
-            {customEditing ? '직접 수정 취소' : '직접 수정'}
+            <Edit3 className="w-3.5 h-3.5" />
+            <span>{customEditing ? '수정 취소' : '직접 수정'}</span>
           </button>
 
+          {/* Action 3: 원문 유지 */}
           <button
             type="button"
-            onClick={() => setShowChat(!showChat)}
-            className="text-slate-500 hover:text-[#050099] font-bold cursor-pointer"
+            id={`btn-keep-orig-${item.id}`}
+            onClick={() => onAdopt(item.id, 'custom', item.originalText)}
+            className="px-3.5 py-2 rounded-xl text-xs font-bold bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 transition-all cursor-pointer whitespace-nowrap"
           >
-            {showChat ? '재수정 대화 닫기' : '대화형 재수정'}
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>원문 유지</span>
+          </button>
+
+          {/* Copy Button */}
+          <button
+            type="button"
+            onClick={() => handleCopy(item.alt1.text, 1)}
+            className="px-3 py-2 rounded-xl text-xs font-bold text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 border border-slate-200 transition-all cursor-pointer flex items-center space-x-1"
+          >
+            <Copy className="w-3.5 h-3.5" />
+            <span>{copiedAlt === 1 ? '복사됨!' : '문구 복사'}</span>
           </button>
         </div>
 
@@ -311,96 +285,88 @@ export const ResultCard: React.FC<ResultCardProps> = ({
           <button
             type="button"
             onClick={() => onFeedback(item.id, 'positive')}
-            className={`px-2 py-1 rounded text-xs font-bold border transition-all cursor-pointer ${
+            className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
               item.feedback?.type === 'positive'
                 ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
                 : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
             }`}
+            title="좋아요 (선호 패턴 학습)"
           >
-            만족
+            <ThumbsUp className="w-3.5 h-3.5" />
           </button>
           <button
             type="button"
             onClick={() => onFeedback(item.id, 'negative')}
-            className={`px-2 py-1 rounded text-xs font-bold border transition-all cursor-pointer ${
+            className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
               item.feedback?.type === 'negative'
                 ? 'bg-rose-50 border-rose-300 text-rose-700'
                 : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
             }`}
+            title="개선 필요"
           >
-            수정 필요
+            <ThumbsDown className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* Accordion: 세부 가이드 및 판정 근거 */}
-      {showDetails && (
-        <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-2">
-          <div className="font-bold text-slate-800">
-            적용 가이드 규칙: {guideRule.title} (권장 어미: {guideRule.toneEndingRule.preferredForm})
+      {/* Direct Custom Edit Form (if active) */}
+      {customEditing && (
+        <div className="p-4 rounded-xl bg-blue-50/50 border border-blue-200 space-y-2.5 animate-in fade-in">
+          <label className="block text-xs font-extrabold text-[#050099]">
+            사용자 최종 교정 문구 입력 (사내 학습 사례로 저장됩니다):
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customText}
+              onChange={(e) => setCustomText(e.target.value)}
+              className="flex-1 px-3 py-2 text-xs rounded-xl border border-slate-300 focus:border-[#050099] focus:ring-1 focus:ring-[#050099] bg-white font-bold"
+              placeholder="직접 교정한 최종 문구를 입력하세요"
+            />
+            <button
+              type="button"
+              onClick={handleSaveCustomEdit}
+              className="px-4 py-2 rounded-xl bg-[#050099] hover:bg-[#040080] text-white text-xs font-extrabold cursor-pointer whitespace-nowrap"
+            >
+              저장 및 학습 반영
+            </button>
           </div>
-          <p className="text-slate-600 leading-relaxed">
-            {guideRule.toneEndingRule.description} (최적 글자수: {guideRule.charLimitRule.unitDescription})
+          <p className="text-[10.5px] text-slate-500">
+            * 입력하신 수정안은 AI 추천안과 함께 브라우저에 저장되어, 향후 유사 문장 교정 시 중요한 참고 사례(Few-shot)로 활용됩니다.
           </p>
-          {(item.violations || []).length > 0 && (
-            <div className="pt-1 space-y-1">
-              <span className="font-bold text-slate-700">검출된 개선 포인트:</span>
-              <ul className="list-disc list-inside text-slate-600 space-y-0.5">
-                {(item.violations || []).map((v, i) => (
-                  <li key={i}>
-                    <strong>[{v.category || v.title || '가이드 개선'}]</strong> {v.description || v.title}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
         </div>
       )}
 
-      {/* Accordion: 직접 수정 입력 */}
-      {customEditing && (
-        <div className="p-3.5 bg-amber-50/60 rounded-xl border border-amber-200 space-y-2">
-          <div className="text-xs font-bold text-amber-900">
-            원하는 카피로 직접 수정 후 채택
+      {/* 4. Second Alternative (간결·친절형) */}
+      <div className="p-3.5 rounded-xl border border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+        <div className="space-y-0.5">
+          <div className="flex items-center space-x-2">
+            <span className="font-extrabold text-[#050099]">대안 2 (간결 대안)</span>
+            <span className="text-[10.5px] text-slate-400 font-mono">공백제외 {alt2CharsNoSpace}자</span>
           </div>
-          <textarea
-            value={customText}
-            onChange={(e) => setCustomText(e.target.value)}
-            rows={2}
-            className="w-full p-2.5 rounded-lg border border-amber-300 bg-white text-xs text-slate-900 focus:outline-hidden"
-          />
+          <p className="text-slate-900 font-bold">{item.alt2.text}</p>
+        </div>
+        <div className="flex items-center space-x-1.5 shrink-0">
           <button
             type="button"
-            onClick={() => {
-              onAdopt(item.id, 'custom', customText);
-              setCustomEditing(false);
-            }}
-            className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-xs cursor-pointer"
+            onClick={() => handleCopy(item.alt2.text, 2)}
+            className="px-2.5 py-1 text-slate-600 hover:text-slate-900 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
           >
-            직접 수정한 카피 채택
+            {copiedAlt === 2 ? '복사됨!' : '복사'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onAdopt(item.id, 2)}
+            className={`px-3 py-1 rounded-lg font-bold cursor-pointer whitespace-nowrap ${
+              item.selectedAlt === 2
+                ? 'bg-[#050099] text-white'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+            }`}
+          >
+            {item.selectedAlt === 2 ? '채택됨' : '대안 2 적용'}
           </button>
         </div>
-      )}
-
-      {/* Accordion: 대화형 재수정 입력 */}
-      {showChat && (
-        <form onSubmit={handleSendChat} className="flex gap-2 pt-1">
-          <input
-            type="text"
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            placeholder="예: 조금 더 부드럽고 친절한 톤으로 바꿔줘..."
-            className="flex-1 px-3 py-2 text-xs rounded-lg border border-slate-200 bg-white text-slate-900 focus:ring-2 focus:ring-[#050099]/20"
-          />
-          <button
-            type="submit"
-            disabled={isRefining || !chatInput.trim()}
-            className="px-4 py-2 bg-[#050099] hover:bg-[#040080] text-white rounded-lg text-xs font-bold disabled:opacity-50 cursor-pointer whitespace-nowrap"
-          >
-            {isRefining ? '재교정 중...' : '재교정 요청'}
-          </button>
-        </form>
-      )}
+      </div>
     </div>
   );
 };

@@ -169,8 +169,45 @@ export interface InspectionSession {
   inputMode: 'text' | 'batch' | 'image' | 'pdf';
   sourceFileName?: string;
   sourcePreviewUrl?: string;
+  activeGuideVersion?: string;
+  activeGuideTitle?: string;
   items: InspectionItemResult[];
   overallSummary?: string;
+}
+
+export interface UploadedGuideVersion {
+  id: string;
+  version: string; // e.g. "v0.3"
+  title: string; // e.g. "UX Writing 가이드 초안 v0.3"
+  fileName: string; // e.g. "UX_Writing_가이드_초안_v0.3.pdf"
+  uploadedAt: string; // e.g. "2026-10-06"
+  pageCount: number; // e.g. 9
+  isActive: boolean;
+  isInitialVersion?: boolean; // 1차 버전
+  fileData?: string; // base64 if uploaded by user
+  summary: string;
+  changelog?: string;
+  extractedRules: {
+    generalPrinciples: Array<{ id: string; title: string; description: string }>;
+    toneLevels: Array<{ level: number; name: string; desc: string; pattern: string }>;
+    componentRules: Array<{
+      ruleId: string; // e.g. "W-201"
+      componentType: UIComponentType;
+      title: string;
+      description: string;
+      limit: string;
+      badExample: string;
+      goodExample: string;
+      page: number;
+    }>;
+    terminology: Array<{
+      id: string;
+      prohibited: string;
+      recommended: string;
+      category: string;
+      reason: string;
+    }>;
+  };
 }
 
 export interface CustomGuideRule {

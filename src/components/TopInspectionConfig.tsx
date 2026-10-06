@@ -117,7 +117,7 @@ export const TopInspectionConfig: React.FC<TopInspectionConfigProps> = ({
                 onClick={onOpenGuideEditor}
                 className="text-[11px] text-[#050099] hover:text-[#040080] font-bold cursor-pointer transition-all hover:underline"
               >
-                가이드 기준 편집 &gt;
+                가이드 PDF 규정 확인 &gt;
               </button>
             )}
           </div>

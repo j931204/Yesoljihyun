@@ -8,6 +8,7 @@ interface LeftInspectionSidebarProps {
   setContext: (c: ContextType) => void;
   toneLevel: ToneLevel;
   setToneLevel: (t: ToneLevel) => void;
+  activeGuideVersion?: string;
 }
 
 export const LeftInspectionSidebar: React.FC<LeftInspectionSidebarProps> = ({
@@ -15,6 +16,7 @@ export const LeftInspectionSidebar: React.FC<LeftInspectionSidebarProps> = ({
   setContext,
   toneLevel,
   setToneLevel,
+  activeGuideVersion = 'v0.3',
 }) => {
   const handleContextChange = (c: ContextType) => {
     setContext(c);
@@ -93,6 +95,9 @@ export const LeftInspectionSidebar: React.FC<LeftInspectionSidebarProps> = ({
               5
             </span>
             <span className="text-sm font-extrabold text-slate-900 tracking-tight">톤 레벨</span>
+          </span>
+          <span className="text-[10.5px] font-bold text-slate-700 bg-white/70 px-2 py-0.5 rounded-md border border-[#c4d2dc]">
+            가이드 {activeGuideVersion} 기준
           </span>
         </div>
 

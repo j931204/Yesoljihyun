@@ -133,11 +133,12 @@ function buildRuleBasedInspection(params: {
     // Check term replacements
     for (const [bad, info] of Object.entries(termDict)) {
       if (cleanText.includes(bad)) {
+        const ruleId = info.cat === '한자어' ? 'W-301' : info.cat === '외국어·외래어' ? 'W-302' : 'W-303';
         violations.push({
           category: info.cat === '한자어' ? '직관성' : info.cat === '외국어·외래어' ? '명확성' : '어법/맞춤법',
           severity: 'high',
-          title: `어려운 ${info.cat} 지양 (${bad} → ${info.term})`,
-          description: `'${bad}'는 고객에게 생소하거나 거부감을 줄 수 있습니다. '${info.term}'(으)로 순화하세요. (${info.reason})`,
+          title: `[${ruleId}] 어려운 ${info.cat} 지양 (${bad} → ${info.term})`,
+          description: `'${bad}'는 고객에게 생소하거나 거부감을 줄 수 있습니다. '${info.term}'(으)로 순화하세요. (${info.reason}) [가이드 기준]`,
           violatedTextPart: bad,
         });
         revisedAlt1 = revisedAlt1.replaceAll(bad, info.term);
@@ -157,8 +158,8 @@ function buildRuleBasedInspection(params: {
         violations.push({
           category: '컴포넌트규칙',
           severity: 'high',
-          title: "버튼 내 '~하기' 접미사 금지 규칙 위배",
-          description: "표준 UX 라이팅 원칙에 따라 버튼은 명사형으로 간결하게 종결해야 합니다.",
+          title: "[W-201] 버튼 내 '~하기' 접미사 금지 규칙 위배",
+          description: "UX Writing 가이드 p.4 규정에 따라 버튼은 명사형으로 간결하게 종결해야 합니다.",
           violatedTextPart: revisedAlt1,
         });
         revisedAlt1 = revisedAlt1.replace(/하기$/, '');
@@ -173,6 +174,17 @@ function buildRuleBasedInspection(params: {
         revisedAlt1 = '이전 화면';
         revisedAlt2 = '돌아가기';
       }
+    }
+
+    // Process general sentences and check active voice (W-204)
+    if (cleanText.includes('소멸되어집니다') || cleanText.includes('지급되어집니다') || cleanText.includes('되어집니다')) {
+      violations.push({
+        category: '어법/맞춤법',
+        severity: 'high',
+        title: '[W-204] 서비스 행위 능동태 원칙 위배 (이중 피동 지양)',
+        description: "가이드 p.6 [W-204] 규정에 따라 불필요한 이중 피동 표현(~되어집니다)을 배제하고 주체 중심의 능동태로 간결히 서술하세요.",
+        violatedTextPart: '되어집니다',
+      });
     }
 
     // Process general sentences
@@ -347,6 +359,7 @@ app.post('/api/gemini/inspect', async (req, res) => {
       customRules = [],
       terminology = [],
       learningMemory = [],
+      activeGuideInfo,
     } = req.body;
 
     const ai = getGeminiClient();
@@ -464,13 +477,26 @@ app.post('/api/gemini/inspect', async (req, res) => {
           .join('\n')
       : '';
 
-    const systemInstruction = `당신은 대한민국 최고의 엔터프라이즈 UX 라이터이자 고객언어 및 UI 컴포넌트 글쓰기 검수 전문가(최고 수준의 엔터프라이즈 UX 라이팅 및 금융/IT 표준 가이드라인 탑재)입니다.
+    const activeGuideRulesStr = activeGuideInfo?.extractedRules?.componentRules?.length
+      ? `\n[사내 공식 배포 언어 가이드 PDF: ${activeGuideInfo.title || 'UX Writing 가이드 초안 v0.3'}]\n` +
+        activeGuideInfo.extractedRules.componentRules
+          .map(
+            (r: any) =>
+              `- [${r.ruleId}] ${r.title} (가이드 p.${r.page}): ${r.description} (지양: "${r.badExample}" -> 권장: "${r.goodExample}")`
+          )
+          .join('\n')
+      : '';
+
+    const systemInstruction = `당신은 대한민국 최고의 엔터프라이즈 UX 라이터이자 고객언어 및 UI 컴포넌트 글쓰기 검수 전문가(최고 수준의 엔터프라이즈 UX 라이팅 및 사내 언어 가이드 PDF 탑재)입니다.
+현재 사내 공식 배포된 언어 가이드 PDF인 [${activeGuideInfo?.title || 'UX Writing 가이드 초안 v0.3'}]의 규정 체계(W-100 총칙, W-200 컴포넌트 규칙, W-300 순화 사전)를 절대적 기준으로 준수하여 검수하세요.
+위배 사항(violations)의 title에는 반드시 해당 가이드의 규칙 번호(예: [W-201] 버튼 내 명사형 종결 규정 위배, [W-204] 서비스 행위 능동태 원칙 위배 등)를 명시하세요.
 
 [검수 환경 및 가이드 기준]
 1. 서비스 유형: ${serviceDescriptions[service] || service}
 2. UI 컴포넌트 / 콘텐츠 유형: ${componentType}
 ${componentTypeGuides[componentType] || componentTypeGuides['button']}
 ${customGuideText}
+${activeGuideRulesStr}
 
 3. 디바이스/플랫폼 제약: ${platformConstraints[platform] || platform}
 4. 상황 맥락: ${contextDescriptions[context] || context}

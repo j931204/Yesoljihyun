@@ -127,11 +127,15 @@ export const BatchResultView: React.FC<BatchResultViewProps> = ({
       <div className="bg-slate-900 rounded-3xl p-6 sm:p-8 text-white shadow-xl">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 pb-6 border-b border-slate-800">
           <div className="space-y-2">
-            <div className="flex items-center space-x-2">
+            <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold text-blue-400">용어 현황 진단</span>
               <span className="text-slate-600">·</span>
               <span className="text-xs text-slate-400">
                 {SERVICES_CONFIG[session.service]?.title} · {PLATFORMS_CONFIG[session.platform]?.title}
+              </span>
+              <span className="text-slate-600">·</span>
+              <span className="px-2 py-0.5 rounded text-[10.5px] font-bold bg-blue-500/20 text-blue-300 border border-blue-400/30">
+                {session.activeGuideTitle || 'UX Writing 가이드 초안 v0.3'} 기준 검수
               </span>
             </div>
             <div className="flex items-center space-x-3">

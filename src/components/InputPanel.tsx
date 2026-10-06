@@ -14,6 +14,7 @@ interface InputPanelProps {
   onInspect: () => void;
   isInspecting: boolean;
   onApplyPreset: (preset: (typeof SAMPLE_PRESETS)[0]) => void;
+  activeGuideVersion?: string;
 }
 
 export const InputPanel: React.FC<InputPanelProps> = ({
@@ -28,6 +29,7 @@ export const InputPanel: React.FC<InputPanelProps> = ({
   onInspect,
   isInspecting,
   onApplyPreset,
+  activeGuideVersion = 'v0.3',
 }) => {
   const [dragActive, setDragActive] = useState(false);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -364,12 +366,12 @@ export const InputPanel: React.FC<InputPanelProps> = ({
           className="flex items-center justify-center px-8 py-3.5 rounded-2xl bg-[#050099] hover:bg-[#040080] text-white text-sm font-extrabold shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer whitespace-nowrap"
         >
           {isInspecting ? (
-            <span>고객언어 가이드 기반 정밀 검수 중...</span>
+            <span>가이드 {activeGuideVersion} 기준 정밀 검수 중...</span>
           ) : (
             <span>
               {inputMode === 'batch' || inputMode === 'image' || inputMode === 'pdf'
-                ? '화면 일괄 검수 실행'
-                : '고객언어 맞춤 검수 시작'}
+                ? `가이드 ${activeGuideVersion} 기준 화면 일괄 검수`
+                : `가이드 ${activeGuideVersion} 기준 맞춤 검수 시작`}
             </span>
           )}
         </button>
