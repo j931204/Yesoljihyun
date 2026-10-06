@@ -79,12 +79,19 @@ ${c.recommendedPattern ? `- 권장 표현(Good): "${c.recommendedPattern}"` : ''
         .join('\n\n')
     : '';
 
+  const componentSpecificHint = componentType === 'button'
+    ? `\n[버튼 컴포넌트 특화 필수 규정]
+- 버튼에 대화체 문장형 서술어(~해주세요, ~해 주세요, ~바랍니다, ~하세요 등)를 사용하는 것은 절대 금지됩니다.
+- 사내 가이드 W-201에 따라 '예약하기', '신청하기', '결제하기', '확인하기' 등 행동을 명확하게 지시하는 액션 CTA(~하기) 또는 명사형으로 교정해야 합니다. (예: "예약해주세요" -> "예약하기")`
+    : '';
+
   return `[사내 공식 언어가이드: ${guideTitle} (${guideVersion})]
 [작업 환경 및 타깃]
 - 대상 컴포넌트: ${componentType}
 - 서비스 도메인: ${service}
 - 상황 맥락: ${context}
 - 목표 톤 레벨: ${toneNames[toneLevel] || `Level ${toneLevel}`}
+${componentSpecificHint}
 
 [검색된 관련 언어가이드 규칙 (RAG Top Matches)]
 ${rulesText}

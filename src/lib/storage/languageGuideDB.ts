@@ -210,13 +210,20 @@ export async function deleteGuideFromDB(guideId: string): Promise<void> {
  */
 export async function seedDefaultGuideIfNeeded(): Promise<UploadedGuideVersion> {
   const guides = await getAllGuidesFromDB();
+  const defaultGuide = INITIAL_PDF_GUIDE_V03;
+
   if (guides.length > 0) {
     const active = guides.find((g) => g.isActive) || guides[0];
-    return active;
+    const existingChunks = await getChunksFromDB(defaultGuide.id);
+    const hasLatestRule = existingChunks.some(
+      (c) => c.prohibitedPattern?.includes('예약해주세요') || c.recommendedPattern?.includes('예약하기')
+    );
+    if (hasLatestRule) {
+      return active;
+    }
   }
 
   // Generate chunks from default v0.3 guide
-  const defaultGuide = INITIAL_PDF_GUIDE_V03;
   const chunks: GuideChunk[] = [];
 
   // 1. General Principles

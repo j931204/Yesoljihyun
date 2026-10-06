@@ -328,7 +328,13 @@ export default function App() {
         // Derive alt2 (concise / polite alternate)
         let alt2Text = alt1Text;
         if (componentType === 'button') {
-          alt2Text = alt1Text.replace(/\s+/g, '');
+          if (alt1Text.endsWith('하기') && alt1Text.length > 2) {
+            alt2Text = alt1Text.replace(/하기$/, ''); // e.g. 예약하기 -> 예약 (명사형 대안)
+          } else if (alt1Text.length <= 4) {
+            alt2Text = `${alt1Text}하기`; // e.g. 예약 -> 예약하기 (액션형 대안)
+          } else {
+            alt2Text = alt1Text.replace(/\s+/g, '');
+          }
         } else if (toneLevel === 2) {
           alt2Text = alt1Text.replace(/합니다\.$/, '해요.').replace(/바랍니다\.$/, '해 주세요.');
         } else {
