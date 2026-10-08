@@ -73,12 +73,53 @@ export interface ComponentGuideRule {
   restrictedCases?: string[];
 }
 
+export type RuleType = 'word' | 'phrase' | 'tone' | 'grammar' | 'example';
+
+export interface RuleExample {
+  before: string;
+  after: string;
+}
+
+export interface StructuredGuideRule {
+  id: string;
+  category: string;
+  type: RuleType;
+  avoid: string[];
+  preferred: string[];
+  description: string;
+  examples: RuleExample[];
+  sourceText: string;
+  componentType?: string;
+}
+
+export interface DebugInspectionData {
+  modelId: string;
+  webLLMVersion: string;
+  temperature: number;
+  top_p: number;
+  enableThinking: boolean;
+  inputSentence: string;
+  exactMatchRules: StructuredGuideRule[];
+  regexMatchRules: StructuredGuideRule[];
+  semanticTopK: Array<{ id: string; title: string; score: number; reason: string }>;
+  promptPassedGuides: string;
+  finalPrompt: string;
+  rawLLMResponse: string;
+  parsedResponse: any;
+  validatorRemovedItems: Array<{ originalPart: string; suggestion: string; reason: string }>;
+  validationApplied: boolean;
+  finalResult: any;
+}
+
 export interface RuleViolation {
   category: '간결성' | '명확성' | '직관성' | '일관성' | '플랫폼제약' | '어법/맞춤법' | '브랜드보이스' | '글자수초과' | '컴포넌트규칙';
   severity: 'high' | 'medium' | 'low';
   title: string;
   description: string;
   violatedTextPart?: string;
+  suggestedTextPart?: string;
+  ruleOrigin?: 'guide' | 'general';
+  sourceText?: string;
 }
 
 export interface CharEvaluation {
@@ -156,6 +197,7 @@ export interface InspectionItemResult {
     timestamp: number;
     suggestedText?: string;
   }>;
+  debugData?: DebugInspectionData;
 }
 
 export interface InspectionSession {
@@ -186,6 +228,7 @@ export interface UploadedGuideVersion {
   isInitialVersion?: boolean; // 1차 버전
   fileData?: string; // base64 if uploaded by user
   rawContent?: string; // Full extracted text or direct text input of the guide
+  structuredRules?: StructuredGuideRule[];
   summary: string;
   changelog?: string;
   extractedRules: {

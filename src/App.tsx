@@ -15,14 +15,17 @@ import { LocalAIStatusBar } from './components/LocalAIStatusBar';
 import { localLLM } from './lib/llm/localLLM';
 import {
   getChunksFromDB,
+  getStructuredRulesFromDB,
   seedDefaultGuideIfNeeded,
   saveGuideWithChunks,
+  saveGuideWithChunksAndRules,
 } from './lib/storage/languageGuideDB';
 import {
   saveCorrectionCase,
   findSimilarPastCases,
 } from './lib/storage/correctionHistoryDB';
 import { chunkLanguageGuideText } from './lib/rag/chunker';
+import { buildStructuredRulesFromGuide } from './lib/rag/ruleExtractor';
 import {
   ServiceType,
   PlatformType,
@@ -221,15 +224,17 @@ export default function App() {
       });
     });
 
-    await saveGuideWithChunks(newGuide, chunks);
+    // Build structured rules
+    const structuredRules = buildStructuredRulesFromGuide(newGuide, chunks);
+    await saveGuideWithChunksAndRules(newGuide, chunks, structuredRules);
 
     setGuideVersions((prev) => [
-      newGuide,
+      { ...newGuide, structuredRules },
       ...prev.map((g) => ({ ...g, isActive: false })),
     ]);
     setActiveGuideId(newGuide.id);
     showToast(
-      `새 언어 가이드 [${newGuide.title} (${newGuide.version})] 배포 완료! 총 ${chunks.length}개 규칙이 브라우저 로컬 RAG에 학습되었습니다.`
+      `새 언어 가이드 [${newGuide.title} (${newGuide.version})] 등록 완료! 총 ${structuredRules.length}개 확정 규칙 및 ${chunks.length}개 RAG 청크가 분석되었습니다.`
     );
   };
 
@@ -285,11 +290,16 @@ export default function App() {
     setErrorMessage(null);
 
     try {
-      // 1. Retrieve RAG Chunks from IndexedDB
+      // 1. Retrieve RAG Chunks and Structured Rules from IndexedDB
       let chunks = await getChunksFromDB(activeGuide.id);
-      if (!chunks || chunks.length === 0) {
+      let structuredRules = await getStructuredRulesFromDB(activeGuide.id);
+      if (!chunks || chunks.length === 0 || structuredRules.length === 0) {
         await seedDefaultGuideIfNeeded();
         chunks = await getChunksFromDB(activeGuide.id);
+        structuredRules = await getStructuredRulesFromDB(activeGuide.id);
+      }
+      if (structuredRules.length === 0) {
+        structuredRules = buildStructuredRulesFromGuide(activeGuide, chunks);
       }
 
       // 2. Prepare text lines
@@ -371,6 +381,7 @@ export default function App() {
           context,
           toneLevel,
           allChunks: chunks,
+          structuredRules,
           pastCases,
         });
 
@@ -471,6 +482,9 @@ export default function App() {
             title: v.rule,
             description: v.reason,
             violatedTextPart: v.originalPart,
+            suggestedTextPart: v.suggestion,
+            ruleOrigin: v.ruleOrigin || 'guide',
+            sourceText: v.sourceText,
           })),
           explanation: localResult.summary,
           similarCases: [

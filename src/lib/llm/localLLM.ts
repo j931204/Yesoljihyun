@@ -1,6 +1,7 @@
 /**
  * In-Browser Local LLM Service (WebLLM / WebGPU)
- * Executes inference 100% on the client GPU with zero external API calls or server costs.
+ * Integrates 3-Stage Hybrid Rule Retrieval, Deterministic Fallbacks,
+ * Post-Processing Validation, and Full Debug Telemetry.
  */
 
 import { CreateMLCEngine, MLCEngineInterface } from '@mlc-ai/web-llm';
@@ -10,10 +11,17 @@ import {
   checkWebGPUSupport,
   WebGPUStatus,
 } from './modelLoader';
-import { buildSystemPrompt, buildUserPrompt, PromptPayload } from './prompt';
+import { buildSystemPrompt, buildUserPrompt } from './prompt';
 import { GuideChunk } from '../storage/languageGuideDB';
 import { PastCorrectionCase } from '../storage/correctionHistoryDB';
-import { searchRelevantGuideRules, ScoredChunk } from '../rag/search';
+import { ScoredChunk } from '../rag/search';
+import { StructuredGuideRule, DebugInspectionData } from '../../types';
+import { hybridRetrieveRules } from '../rag/hybridSearch';
+import {
+  validateCorrectionResult,
+  applyDeterministicReplacements,
+  normalizeCopy,
+} from './validator';
 
 export type LLMStage =
   | 'idle'
@@ -38,6 +46,8 @@ export interface LocalInspectionViolation {
   originalPart: string;
   suggestion: string;
   reason: string;
+  ruleOrigin?: 'guide' | 'general';
+  sourceText?: string;
 }
 
 export interface LocalInspectionResult {
@@ -51,24 +61,19 @@ export interface LocalInspectionResult {
   usedPastCases: PastCorrectionCase[];
   isLocalLLM: boolean;
   modelName: string;
+  debugData?: DebugInspectionData;
 }
 
-type ProgressListener = (report: LLMProgressReport) => void;
-
-function cleanPunct(str: string): string {
-  return (str || '').replace(/[.!?~,'"`·\s]+$/g, '').trim();
-}
-
-class LocalLLMManager {
-  private static instance: LocalLLMManager | null = null;
+export class LocalLLMManager {
+  private static instance: LocalLLMManager;
   private engine: MLCEngineInterface | null = null;
-  private currentModelId: string = DEFAULT_MODEL_ID;
   private stage: LLMStage = 'idle';
-  private progressPercent: number = 0;
-  private statusMessage: string = 'AI 모델 준비 대기 중';
-  private listeners: Set<ProgressListener> = new Set();
+  private progressPercent = 0;
+  private statusMessage = '대기 중';
+  private currentModelId = DEFAULT_MODEL_ID;
+  private listeners: Array<(report: LLMProgressReport) => void> = [];
+  private gpuStatus: WebGPUStatus | null = null;
   private initPromise: Promise<boolean> | null = null;
-  private webGPUStatus: WebGPUStatus | null = null;
 
   private constructor() {}
 
@@ -79,11 +84,11 @@ class LocalLLMManager {
     return LocalLLMManager.instance;
   }
 
-  public subscribe(listener: ProgressListener): () => void {
-    this.listeners.add(listener);
-    listener(this.getProgressReport());
+  public subscribe(fn: (report: LLMProgressReport) => void): () => void {
+    this.listeners.push(fn);
+    fn(this.getProgressReport());
     return () => {
-      this.listeners.delete(listener);
+      this.listeners = this.listeners.filter((l) => l !== fn);
     };
   }
 
@@ -97,94 +102,94 @@ class LocalLLMManager {
       stage: this.stage,
       progressPercent: this.progressPercent,
       statusMessage: this.statusMessage,
-      loadedModelId: this.engine ? this.currentModelId : undefined,
+      loadedModelId: this.currentModelId,
     };
+  }
+
+  public getGPUStatus(): WebGPUStatus | null {
+    return this.gpuStatus;
   }
 
   public isReady(): boolean {
     return this.stage === 'ready' && this.engine !== null;
   }
 
-  public getStage(): LLMStage {
-    return this.stage;
-  }
-
   /**
-   * Initializes the in-browser WebLLM engine with one-time model caching
+   * Initializes local WebLLM engine with WebGPU
    */
-  public async initializeModel(preferredModelId?: string): Promise<boolean> {
-    if (this.isReady()) return true;
+  public async initEngine(preferredModelId = DEFAULT_MODEL_ID): Promise<boolean> {
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
-      // 1. Check WebGPU Support
       this.stage = 'checking_gpu';
-      this.statusMessage = '브라우저 WebGPU 지원 여부 확인 중...';
+      this.progressPercent = 5;
+      this.statusMessage = '브라우저 WebGPU 가속 기능 확인 중...';
       this.notify();
 
-      this.webGPUStatus = await checkWebGPUSupport();
-      if (!this.webGPUStatus.supported) {
+      this.gpuStatus = await checkWebGPUSupport();
+      if (!this.gpuStatus.supported) {
         this.stage = 'unsupported_gpu';
-        this.statusMessage = this.webGPUStatus.reason || 'WebGPU를 사용할 수 없습니다.';
+        this.progressPercent = 0;
+        this.statusMessage =
+          'WebGPU를 지원하지 않는 브라우저 또는 환경입니다. 확정 규칙 엔진(Deterministic Rule Engine)으로 자동 전환됩니다.';
         this.notify();
         return false;
       }
 
-      // 2. Select Model (Default Qwen2.5 1.5B)
-      const targetModel = preferredModelId || this.currentModelId || DEFAULT_MODEL_ID;
-      this.currentModelId = targetModel;
-
+      this.currentModelId = preferredModelId;
       this.stage = 'loading_model';
-      this.statusMessage = 'AI 모델 확인 및 다운로드 준비 중... (첫 1회만 다운로드되며 브라우저에 캐시됩니다)';
-      this.progressPercent = 0;
+      this.progressPercent = 15;
+      this.statusMessage = `로컬 AI 모델(${this.currentModelId}) 로딩 준비 중...`;
       this.notify();
 
       try {
-        this.engine = await CreateMLCEngine(targetModel, {
-          initProgressCallback: (report) => {
-            const pct = Math.round(report.progress * 100);
-            this.progressPercent = isNaN(pct) ? 0 : Math.min(100, pct);
+        const initProgressCallback = (report: any) => {
+          const rawText = report.text || '';
+          let percent = 20;
 
-            if (report.text.includes('Loading model from cache') || report.text.includes('cache')) {
-              this.statusMessage = `브라우저 캐시에서 AI 모델 로드 중... (${this.progressPercent}%)`;
-            } else if (report.text.includes('Fetch') || report.text.includes('download')) {
-              this.statusMessage = `로컬 AI 모델 다운로드 중... (${this.progressPercent}%)`;
-            } else {
-              this.statusMessage = report.text || 'AI 엔진 초기화 중...';
-            }
+          const match = rawText.match(/(\d+)%/);
+          if (match) {
+            percent = Math.min(95, Math.max(15, parseInt(match[1], 10)));
+          } else if (rawText.includes('Loading model')) {
+            percent = 40;
+          } else if (rawText.includes('Loading tokenizer')) {
+            percent = 80;
+          } else if (rawText.includes('Finish loading')) {
+            percent = 95;
+          }
 
-            if (this.progressPercent >= 99) {
-              this.stage = 'initializing';
-            } else {
-              this.stage = 'loading_model';
-            }
-            this.notify();
-          },
+          this.progressPercent = percent;
+          this.statusMessage = `AI 모델 온디바이스 로딩 중: ${rawText || `${percent}%`}`;
+          this.notify();
+        };
+
+        this.engine = await CreateMLCEngine(this.currentModelId, {
+          initProgressCallback,
+          logLevel: 'WARN',
         });
 
         this.stage = 'ready';
         this.progressPercent = 100;
-        this.statusMessage = `로컬 AI 모델(${targetModel}) 준비 완료 (100% 온디바이스 추론)`;
+        this.statusMessage = `로컬 AI 모델(${this.currentModelId}) 브라우저 로딩 완료`;
         this.notify();
         return true;
       } catch (err: any) {
-        console.warn(`[LocalLLM] Failed loading ${targetModel}:`, err);
+        console.warn(`[LocalLLM] Primary model (${this.currentModelId}) failed to load:`, err);
 
-        // Fallback to lighter model (0.5B) if 1.5B fails
-        if (targetModel !== FALLBACK_MODEL_ID) {
+        // Fallback model trial
+        if (this.currentModelId !== FALLBACK_MODEL_ID) {
           try {
-            console.log(`[LocalLLM] Attempting fallback to lightweight model: ${FALLBACK_MODEL_ID}`);
+            console.log(`[LocalLLM] Attempting fallback model: ${FALLBACK_MODEL_ID}`);
             this.currentModelId = FALLBACK_MODEL_ID;
-            this.statusMessage = '경량형 모델로 전환 중...';
+            this.statusMessage = `경량형 AI 모델(${FALLBACK_MODEL_ID})로 전환 로딩 중...`;
             this.notify();
 
             this.engine = await CreateMLCEngine(FALLBACK_MODEL_ID, {
-              initProgressCallback: (report) => {
-                const pct = Math.round(report.progress * 100);
-                this.progressPercent = isNaN(pct) ? 0 : pct;
-                this.statusMessage = `경량형 AI 모델 로딩 중... (${this.progressPercent}%)`;
+              initProgressCallback: (report: any) => {
+                this.statusMessage = `경량형 모델 로딩 중: ${report.text || ''}`;
                 this.notify();
               },
+              logLevel: 'WARN',
             });
 
             this.stage = 'ready';
@@ -210,7 +215,14 @@ class LocalLLMManager {
   }
 
   /**
-   * Run local inference on input sentence using client-side RAG rules and past few-shot cases
+   * Alias for model initialization
+   */
+  public async initializeModel(modelId?: string): Promise<boolean> {
+    return this.initEngine(modelId || this.currentModelId);
+  }
+
+  /**
+   * Run local inference on input sentence using 3-stage hybrid RAG rules and validation layer
    */
   public async inspectSentence(params: {
     inputSentence: string;
@@ -221,6 +233,7 @@ class LocalLLMManager {
     context: string;
     toneLevel: number;
     allChunks: GuideChunk[];
+    structuredRules?: StructuredGuideRule[];
     pastCases: PastCorrectionCase[];
   }): Promise<LocalInspectionResult> {
     const {
@@ -232,10 +245,11 @@ class LocalLLMManager {
       context,
       toneLevel,
       allChunks,
+      structuredRules = [],
       pastCases,
     } = params;
 
-    // Detect if input sentence mentions button or is a button phrase
+    // Detect button component
     let effectiveComponentType = componentType;
     if (
       inputSentence.includes('버튼') ||
@@ -243,38 +257,51 @@ class LocalLLMManager {
       inputSentence.endsWith('하기') ||
       inputSentence.includes('예약해주세요') ||
       inputSentence.includes('신청해주세요') ||
-      inputSentence.includes('결제해주세요')
+      inputSentence.includes('결제해주세요') ||
+      inputSentence.includes('확인해주세요')
     ) {
       if (componentType === 'general' || !componentType) {
         effectiveComponentType = 'button';
       }
     }
 
-    // 1. RAG Search: Retrieve Top 5~10 most relevant guide rules
-    const relevantRules = searchRelevantGuideRules(inputSentence, allChunks, {
-      componentType: effectiveComponentType,
-      limit: 8,
-    });
+    // 1. 3-Stage Hybrid Rule Retrieval
+    const hybridResult = hybridRetrieveRules(
+      inputSentence,
+      structuredRules,
+      allChunks,
+      {
+        componentType: effectiveComponentType,
+        limitSemantic: 6,
+      }
+    );
 
-    // 2. Few-shot Selection: Retrieve top 2~3 past correction cases
+    const { exactMatchRules, regexMatchRules, semanticChunks, debugScores } = hybridResult;
     const selectedPastCases = pastCases.slice(0, 3);
-    const appliedRules = relevantRules.map((r) => r.chunk.title);
+    const appliedRules = [
+      ...exactMatchRules.map((r) => r.category || r.id),
+      ...semanticChunks.map((s) => s.chunk.title),
+    ];
 
-    // 3. If Local LLM engine is not initialized or still downloading, run high-precision client heuristic rule engine
+    // 2. Check if engine is available
     if (!this.engine || this.stage !== 'ready') {
-      console.log('[LocalLLM] Engine not ready, running client-side RAG heuristic engine.');
-      return this.runClientHeuristicFallback({
+      console.log('[LocalLLM] Engine not ready, executing deterministic hybrid rule engine.');
+      return this.runDeterministicRuleEngine({
         inputSentence,
-        relevantRules,
+        exactMatchRules,
+        regexMatchRules,
+        semanticChunks,
         selectedPastCases,
         componentType: effectiveComponentType,
         toneLevel,
-        modelName: 'Client RAG Rule Engine (온디바이스)',
-        allChunks,
+        modelName: 'Deterministic Hybrid Rule Engine (온디바이스)',
+        debugScores,
+        guideTitle,
+        guideVersion,
       });
     }
 
-    // 4. Build Prompts for WebLLM
+    // 3. WebLLM Inference with Prompt Structuring
     const systemPrompt = buildSystemPrompt(guideTitle, guideVersion);
     const userPrompt = buildUserPrompt({
       inputSentence,
@@ -284,22 +311,28 @@ class LocalLLMManager {
       service,
       context,
       toneLevel,
-      relevantRules,
+      exactMatchRules,
+      relevantRules: semanticChunks,
       pastCases: selectedPastCases,
     });
+
+    let rawLLMResponse = '';
+    let parsedLLM: any = null;
 
     try {
       this.stage = 'inspecting';
       this.statusMessage = '로컬 AI 모델이 가이드를 기반으로 문구를 분석 중입니다...';
       this.notify();
 
+      // Generation configuration: low temperature (0.15) for consistency, top_p: 0.8
       const completion = await this.engine.chat.completions.create({
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
         temperature: 0.15,
-        max_tokens: 800,
+        top_p: 0.8,
+        max_tokens: 600,
         response_format: { type: 'json_object' },
       });
 
@@ -307,65 +340,142 @@ class LocalLLMManager {
       this.statusMessage = '교정 완료';
       this.notify();
 
-      const content = completion.choices[0]?.message?.content || '{}';
-      const parsed = this.parseJsonSafely(content);
+      rawLLMResponse = completion.choices[0]?.message?.content || '{}';
+      parsedLLM = this.parseJsonSafely(rawLLMResponse);
 
-      // Verify and guarantee guide enforcement
-      const heuristicValidation = this.runClientHeuristicFallback({
+      // 4. Post-processing Validation Layer (Conditions A ~ E + Deterministic Guidance)
+      let validation = validateCorrectionResult(
         inputSentence,
-        relevantRules,
-        selectedPastCases,
-        componentType: effectiveComponentType,
-        toneLevel,
-        modelName: this.currentModelId,
-        allChunks,
-      });
+        parsedLLM || { needsRevision: false, revised: inputSentence, violations: [] },
+        exactMatchRules
+      );
 
-      if (parsed && typeof parsed.needsRevision === 'boolean') {
-        let finalRevised = parsed.revised || inputSentence;
-        let finalViolations = Array.isArray(parsed.violations) ? parsed.violations : [];
-        let finalNeedsRevision = parsed.needsRevision;
-
-        // If heuristic found guide violations that LLM missed (e.g. uploaded guide exact match), enforce heuristic
-        if (heuristicValidation.needsRevision) {
-          finalRevised = heuristicValidation.revised;
-          finalNeedsRevision = true;
-          const existingRuleTitles = new Set(finalViolations.map((v) => v.rule));
-          heuristicValidation.violations.forEach((hv) => {
-            if (!existingRuleTitles.has(hv.rule)) {
-              finalViolations.unshift(hv);
-            }
+      // If validation signaled retry need
+      if (validation.needRetry && validation.retryReason) {
+        console.warn(`[LocalLLM] Validation retry triggered: ${validation.retryReason}`);
+        try {
+          const retryPrompt = buildUserPrompt({
+            inputSentence,
+            guideTitle,
+            guideVersion,
+            componentType: effectiveComponentType,
+            service,
+            context,
+            toneLevel,
+            exactMatchRules,
+            relevantRules: semanticChunks,
+            pastCases: selectedPastCases,
+            retryReason: validation.retryReason,
           });
-        }
 
-        return {
-          needsRevision: finalNeedsRevision,
-          original: parsed.original || inputSentence,
-          revised: finalRevised,
-          violations: finalViolations,
-          summary: parsed.summary || heuristicValidation.summary || '사내 언어가이드 기준 정밀 교정이 완료되었습니다.',
-          appliedRules,
-          relevantChunks: relevantRules,
-          usedPastCases: selectedPastCases,
-          isLocalLLM: true,
-          modelName: this.currentModelId,
-        };
+          const retryCompletion = await this.engine.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: retryPrompt },
+            ],
+            temperature: 0.1,
+            top_p: 0.8,
+            max_tokens: 600,
+            response_format: { type: 'json_object' },
+          });
+
+          const retryRaw = retryCompletion.choices[0]?.message?.content || '{}';
+          const retryParsed = this.parseJsonSafely(retryRaw);
+          if (retryParsed) {
+            rawLLMResponse = retryRaw;
+            parsedLLM = retryParsed;
+            validation = validateCorrectionResult(inputSentence, retryParsed, exactMatchRules);
+          }
+        } catch (retryErr) {
+          console.error('[LocalLLM] Retry generation failed:', retryErr);
+        }
       }
 
-      // If LLM returned unparsable response, use heuristic output
-      return heuristicValidation;
+      // If exact avoid terms STILL remain after retry, apply deterministic replacement
+      let finalRevised = validation.revised;
+      let finalViolations = validation.violations;
+      let finalNeedsRevision = validation.needsRevision;
+      let finalSummary = validation.summary;
+
+      if (exactMatchRules.length > 0 && validation.unresolvedAvoidTerms.length > 0) {
+        console.warn('[LocalLLM] Applying deterministic rule replacement for unhandled avoid terms.');
+        const deterministic = applyDeterministicReplacements(inputSentence, exactMatchRules);
+        finalRevised = deterministic.revised;
+        finalViolations = deterministic.appliedViolations;
+        finalNeedsRevision = deterministic.appliedViolations.length > 0;
+        finalSummary = '가이드 규칙에 따른 확정 권장 표현으로 정밀 교정했습니다.';
+      }
+
+      // Ensure every violation has sourceText and origin
+      const enrichedViolations: LocalInspectionViolation[] = finalViolations.map((v) => {
+        const matchingExact = exactMatchRules.find(
+          (r) => r.avoid.some((a) => normalizeCopy(a) === normalizeCopy(v.originalPart))
+        );
+        return {
+          ...v,
+          ruleOrigin: matchingExact ? 'guide' : (v.ruleOrigin || 'general'),
+          sourceText: matchingExact?.sourceText || v.sourceText || undefined,
+        };
+      });
+
+      const debugData: DebugInspectionData = {
+        modelId: this.currentModelId,
+        webLLMVersion: '@mlc-ai/web-llm v0.2.85',
+        temperature: 0.15,
+        top_p: 0.8,
+        enableThinking: false,
+        inputSentence,
+        exactMatchRules,
+        regexMatchRules,
+        semanticTopK: semanticChunks.map((s) => ({
+          id: s.chunk.ruleId,
+          title: s.chunk.title,
+          score: s.score,
+          reason: s.matchReasons.join(', '),
+        })),
+        promptPassedGuides: exactMatchRules.map((r) => `${r.avoid.join(', ')} -> ${r.preferred.join(', ')}`).join(' | '),
+        finalPrompt: userPrompt,
+        rawLLMResponse,
+        parsedResponse: parsedLLM,
+        validatorRemovedItems: validation.removedSameWordViolations,
+        validationApplied: true,
+        finalResult: {
+          needsRevision: finalNeedsRevision,
+          revised: finalRevised,
+          violations: enrichedViolations,
+          summary: finalSummary,
+        },
+      };
+
+      return {
+        needsRevision: finalNeedsRevision,
+        original: inputSentence,
+        revised: finalNeedsRevision ? finalRevised : inputSentence,
+        violations: finalNeedsRevision ? enrichedViolations : [],
+        summary: finalSummary,
+        appliedRules,
+        relevantChunks: semanticChunks,
+        usedPastCases: selectedPastCases,
+        isLocalLLM: true,
+        modelName: this.currentModelId,
+        debugData,
+      };
     } catch (err: any) {
-      console.error('[LocalLLM] Inference error, falling back to local heuristic:', err);
+      console.error('[LocalLLM] Inference error, falling back to deterministic hybrid engine:', err);
       this.stage = 'ready';
       this.notify();
-      return this.runClientHeuristicFallback({
+      return this.runDeterministicRuleEngine({
         inputSentence,
-        relevantRules,
+        exactMatchRules,
+        regexMatchRules,
+        semanticChunks,
         selectedPastCases,
         componentType: effectiveComponentType,
         toneLevel,
-        modelName: 'Client RAG Rule Engine (Fallback)',
-        allChunks,
+        modelName: 'Deterministic Hybrid Rule Engine (Fallback)',
+        debugScores,
+        guideTitle,
+        guideVersion,
       });
     }
   }
@@ -387,270 +497,173 @@ class LocalLLMManager {
   }
 
   /**
-   * Client-side Heuristic Engine Fallback
-   * Enforces uploaded guide chunks, button rules, and terminology dynamically.
+   * Deterministic Rule Engine
+   * Executes exact matches, button regulations, and terminology substitutions without LLM hallucinations.
    */
-  private runClientHeuristicFallback(params: {
+  public runDeterministicRuleEngine(params: {
     inputSentence: string;
-    relevantRules: ScoredChunk[];
+    exactMatchRules: StructuredGuideRule[];
+    regexMatchRules: StructuredGuideRule[];
+    semanticChunks: ScoredChunk[];
     selectedPastCases: PastCorrectionCase[];
     componentType: string;
     toneLevel: number;
     modelName: string;
-    allChunks?: GuideChunk[];
+    debugScores: Array<{ id: string; title: string; score: number; reason: string }>;
+    guideTitle: string;
+    guideVersion: string;
   }): LocalInspectionResult {
     const {
       inputSentence,
-      relevantRules,
+      exactMatchRules,
+      regexMatchRules,
+      semanticChunks,
       selectedPastCases,
       componentType,
-      toneLevel,
       modelName,
-      allChunks,
+      debugScores,
     } = params;
 
     let revised = inputSentence.trim();
     const violations: LocalInspectionViolation[] = [];
 
-    // Strip button quotes / prefixes if present e.g. 버튼 "예약해주세요" or [버튼] 예약해주세요
-    let prefix = '';
-    const prefixMatch = revised.match(/^(\[(?:버튼|확인\s*버튼|취소\s*버튼|CTA|Action)\]|\b버튼\b\s*[:：]?\s*)(["'“‘]?)(.*?)(["'”’]?)$/i);
-    let innerText = revised;
-    if (prefixMatch) {
-      prefix = prefixMatch[1];
-      innerText = prefixMatch[3].trim();
-    } else {
-      const quoteMatch = revised.match(/^["'“‘](.*?)["'”’]$/);
-      if (quoteMatch) {
-        innerText = quoteMatch[1].trim();
-      }
-    }
+    // Helper for applying rule replacements
+    const applyRulesList = (rulesList: StructuredGuideRule[]) => {
+      for (const rule of rulesList) {
+        const preferred = rule.preferred[0]?.trim();
+        if (!preferred) continue;
 
-    // 0. Check Past Correction Cases from IndexedDB (Few-Shot memory)
-    if (selectedPastCases && selectedPastCases.length > 0) {
-      for (const pc of selectedPastCases) {
-        if (
-          pc.original &&
-          (pc.original.trim() === inputSentence.trim() || pc.original.trim() === innerText) &&
-          pc.finalRevision
-        ) {
-          revised = prefix ? `${prefix} ${pc.finalRevision}` : pc.finalRevision;
-          violations.push({
-            rule: `[과거 채택 학습] ${pc.appliedRules.join(', ') || '가이드 표준 준수'}`,
-            originalPart: pc.original,
-            suggestion: pc.finalRevision,
-            reason: '과거에 사용자가 최종 채택하거나 직접 수정한 모범 사례(Few-Shot Memory)를 학습하여 동일하게 반영했습니다.',
-          });
-          break;
+        for (const rawAvoid of rule.avoid) {
+          const avoid = rawAvoid?.trim();
+          if (!avoid || avoid === preferred) continue;
+
+          let target = '';
+          if (revised.includes(avoid)) {
+            target = avoid;
+          } else {
+            const strippedAvoid = avoid.replace(/[.!?~,\s]+$/, '');
+            if (strippedAvoid && revised.includes(strippedAvoid)) {
+              target = strippedAvoid;
+            }
+          }
+
+          if (target && target !== preferred) {
+            violations.push({
+              rule: `[${rule.id}] ${rule.category}`,
+              originalPart: target,
+              suggestion: preferred,
+              reason: rule.description || '사내 공식 언어가이드 확정 적용 규칙',
+              ruleOrigin: 'guide',
+              sourceText: rule.sourceText,
+            });
+            revised = revised.replaceAll(target, preferred);
+            break;
+          }
         }
       }
-    }
+    };
 
-    // 1. DYNAMIC GUIDE RULE MATCHING (From Active Uploaded Guide Chunks & RAG)
-    // Gather all candidate chunks from uploaded guide and top search results
-    const activeRuleChunks = allChunks && allChunks.length > 0 ? allChunks : relevantRules.map((r) => r.chunk);
+    // 1. Apply Confirmed Exact Match Rules
+    applyRulesList(exactMatchRules);
 
-    for (const chunk of activeRuleChunks) {
-      // Build paired (bad, good) lists from chunk
-      const pairs: Array<{ bad: string; good: string; rule: string; reason: string }> = [];
+    // 2. Apply Regex Match Rules
+    applyRulesList(regexMatchRules);
 
-      // Extract from beforeExample / afterExample
-      if (chunk.beforeExample && chunk.afterExample && chunk.beforeExample !== chunk.afterExample) {
-        const befores = chunk.beforeExample.split(/[\/\n|]+/).map((b) => b.trim()).filter((b) => b.length >= 2);
-        const afters = chunk.afterExample.split(/[\/\n|]+/).map((a) => a.trim()).filter((a) => a.length >= 1);
-        if (befores.length === afters.length && befores.length > 1) {
-          befores.forEach((b, idx) => {
-            pairs.push({
-              bad: b,
-              good: afters[idx],
-              rule: `[${chunk.ruleId}] ${chunk.title}`,
-              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
-            });
-          });
+    // 3. Apply explicit before/after pairs from retrieved Semantic Chunks
+    for (const sc of semanticChunks) {
+      const chunk = sc.chunk;
+      const before = (chunk.beforeExample || chunk.prohibitedPattern || '').trim();
+      const after = (chunk.afterExample || chunk.recommendedPattern || '').trim();
+      if (before && after && before !== after) {
+        let target = '';
+        if (revised.includes(before)) {
+          target = before;
         } else {
-          befores.forEach((b) => {
-            pairs.push({
-              bad: b,
-              good: afters[0] || chunk.afterExample.trim(),
-              rule: `[${chunk.ruleId}] ${chunk.title}`,
-              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
-            });
-          });
+          const strippedBefore = before.replace(/[.!?~,\s]+$/, '');
+          if (strippedBefore && revised.includes(strippedBefore)) {
+            target = strippedBefore;
+          }
         }
-      }
 
-      // Extract from prohibitedPattern / recommendedPattern
-      if (chunk.prohibitedPattern && chunk.recommendedPattern && chunk.prohibitedPattern !== chunk.recommendedPattern) {
-        const probs = chunk.prohibitedPattern.split(/[\/\n|]+/).map((b) => b.trim()).filter((b) => b.length >= 2);
-        const recos = chunk.recommendedPattern.split(/[\/\n|]+/).map((a) => a.trim()).filter((a) => a.length >= 1);
-        if (probs.length === recos.length && probs.length > 1) {
-          probs.forEach((p, idx) => {
-            pairs.push({
-              bad: p,
-              good: recos[idx],
-              rule: `[${chunk.ruleId}] ${chunk.title}`,
-              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
-            });
-          });
-        } else {
-          probs.forEach((p) => {
-            pairs.push({
-              bad: p,
-              good: recos[0] || chunk.recommendedPattern.trim(),
-              rule: `[${chunk.ruleId}] ${chunk.title}`,
-              reason: chunk.description || '사내 언어가이드 권장 표현을 적용합니다.',
-            });
-          });
-        }
-      }
-
-      // Check each pair against revised and innerText
-      for (const pair of pairs) {
-        const badClean = cleanPunct(pair.bad);
-        const goodClean = pair.good.trim();
-        const revisedClean = cleanPunct(revised);
-        const innerClean = cleanPunct(innerText);
-
-        // Exact match (with or without punctuation)
-        if (revisedClean === badClean || innerClean === badClean) {
+        if (target && target !== after && !violations.some((v) => v.originalPart === target)) {
           violations.push({
-            rule: pair.rule,
-            originalPart: innerText || revised,
-            suggestion: goodClean,
-            reason: pair.reason,
+            rule: `[${chunk.ruleId}] ${chunk.title}`,
+            originalPart: target,
+            suggestion: after,
+            reason: chunk.description || '사내 가이드 세부 규정 준수',
+            ruleOrigin: 'guide',
+            sourceText: `${target} -> ${after}`,
           });
-          revised = prefix ? `${prefix} ${goodClean}` : goodClean;
-          break;
-        }
-
-        // Substring match
-        if (badClean.length >= 3 && revised.includes(badClean)) {
-          violations.push({
-            rule: pair.rule,
-            originalPart: badClean,
-            suggestion: goodClean,
-            reason: pair.reason,
-          });
-          revised = revised.replaceAll(badClean, goodClean);
-          break;
-        }
-
-        // Check if bad without period matches revised without period
-        if (badClean.length >= 3 && revisedClean.includes(badClean)) {
-          violations.push({
-            rule: pair.rule,
-            originalPart: badClean,
-            suggestion: goodClean,
-            reason: pair.reason,
-          });
-          const trailingPeriod = revised.endsWith('.') ? '.' : '';
-          revised = revisedClean.replace(badClean, goodClean) + (goodClean.endsWith('.') ? '' : trailingPeriod);
-          break;
+          revised = revised.replaceAll(target, after);
         }
       }
     }
 
-    // 2. Button Component Rules (핵심: 대화체/문장형 ~해주세요 금지 -> 행동형 ~하기 권장)
+    // 4. Button Component Rules
     const isButton =
       componentType === 'button' ||
       inputSentence.includes('버튼') ||
       inputSentence.startsWith('[버튼') ||
       inputSentence.endsWith('하기') ||
-      prefix !== '';
+      inputSentence.includes('예약해주세요') ||
+      inputSentence.includes('신청해주세요');
 
     if (isButton) {
-      // Direct high-frequency button mappings
-      const directButtonMap: Record<string, string> = {
+      const buttonMap: Record<string, string> = {
         '예약해주세요': '예약하기',
         '예약해 주세요': '예약하기',
-        '예약하세요': '예약하기',
-        '예약바랍니다': '예약하기',
-        '예약해 주십시오': '예약하기',
         '신청해주세요': '신청하기',
         '신청해 주세요': '신청하기',
-        '신청하세요': '신청하기',
-        '신청바랍니다': '신청하기',
         '결제해주세요': '결제하기',
         '결제해 주세요': '결제하기',
-        '결제하세요': '결제하기',
-        '결제바랍니다': '결제하기',
         '확인해주세요': '확인하기',
         '확인해 주세요': '확인하기',
-        '확인하세요': '확인하기',
-        '확인바랍니다': '확인하기',
         '조회해주세요': '조회하기',
-        '조회해 주세요': '조회하기',
         '등록해주세요': '등록하기',
-        '등록해 주세요': '등록하기',
         '구매해주세요': '구매하기',
         '가입해주세요': '가입하기',
-        '가입해 주세요': '가입하기',
         '다운로드해주세요': '다운로드하기',
         '문의해주세요': '문의하기',
         '선택해주세요': '선택하기',
-        '선택해 주세요': '선택하기',
         '변경해주세요': '변경하기',
-        '변경해 주세요': '변경하기',
         '취소해주세요': '취소하기',
         '이용해주세요': '이용하기',
-        '이용해 주세요': '이용하기',
-        '참여해주세요': '참여하기',
       };
 
-      for (const [badBtn, goodBtn] of Object.entries(directButtonMap)) {
-        if (revised.includes(badBtn) || innerText.includes(badBtn)) {
-          const original = innerText.includes(badBtn) ? badBtn : revised;
+      for (const [bad, good] of Object.entries(buttonMap)) {
+        if (revised.includes(bad)) {
           violations.push({
             rule: "[W-201] 버튼 표기 원칙 (대화체 '~해주세요' 지양, 행동형 '~하기' 권장)",
-            originalPart: original,
-            suggestion: goodBtn,
+            originalPart: bad,
+            suggestion: good,
             reason: "사내 UX Writing 가이드(W-201)에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
+            ruleOrigin: 'guide',
+            sourceText: "W-201: 버튼에는 대화체 서술어(~해주세요)를 쓰지 않으며 액션 CTA(~하기)를 권장합니다.",
           });
-          if (prefix) {
-            revised = `${prefix} ${goodBtn}`;
-          } else if (revised.match(/^["'“‘].*?["'”’]$/)) {
-            revised = goodBtn;
-          } else {
-            revised = revised.replaceAll(badBtn, goodBtn);
-          }
+          revised = revised.replaceAll(bad, good);
           break;
         }
       }
 
-      // Generalized regex for any Korean verb in buttons: [어간] + 해 주세요 / 해주세요 / 하세요 / 바랍니다
-      const cleanBtn = cleanPunct(innerText || revised);
-      const politeButtonMatch = cleanBtn.match(
-        /^(.*?)(?:을|를)?\s*(?:해\s*주세요|해주세요|해줘|하세요|하십시오|바랍니다|해\s*바랍니다)$/
-      );
-      if (politeButtonMatch) {
-        const root = politeButtonMatch[1].trim();
-        if (root && root !== revised) {
-          const suggested = `${root}하기`;
-          const existingViolation = violations.some((v) => v.rule.includes('W-201'));
-          if (!existingViolation) {
-            violations.push({
-              rule: "[W-201] 버튼 표기 원칙 (대화체 '~해주세요' 지양, 행동형 '~하기' 권장)",
-              originalPart: cleanBtn,
-              suggestion: suggested,
-              reason: "사내 UX Writing 가이드(W-201)에 따라 버튼에는 대화체 문장형 서술어('~해주세요')를 사용하지 않고, 사용자의 행동을 명확하게 유도하는 액션형('~하기')으로 제시해야 합니다.",
-            });
-          }
-          revised = prefix ? `${prefix} ${suggested}` : suggested;
-        }
-      }
-
-      // Check if button text has redundant filler like "버튼을 클릭하세요", "버튼을 눌러주세요"
-      if (revised.includes('버튼을') && (revised.includes('눌러') || revised.includes('클릭'))) {
-        const simplified = revised
-          .replace(/\s*버튼을\s*(?:눌러주세요|클릭하세요|클릭해 주세요|누르세요)\s*$/, '')
-          .trim();
-        if (simplified) {
-          revised = simplified.endsWith('하기') ? simplified : `${simplified}하기`;
+      // Generalized polite ending regex in buttons
+      const politeMatch = revised.match(/^(.*?)(?:을|를)?\s*(?:해\s*주세요|해주세요|해줘|하세요|하십시오|바랍니다)$/);
+      if (politeMatch && politeMatch[1].trim()) {
+        const root = politeMatch[1].trim();
+        const suggested = `${root}하기`;
+        if (suggested !== revised && !violations.some((v) => v.rule.includes('W-201'))) {
+          violations.push({
+            rule: "[W-201] 버튼 표기 원칙 (대화체 '~해주세요' 지양, 행동형 '~하기' 권장)",
+            originalPart: revised,
+            suggestion: suggested,
+            reason: "사내 UX Writing 가이드에 따라 버튼에는 대화체 문장형 서술어를 사용하지 않고 액션형(~하기)을 권장합니다.",
+            ruleOrigin: 'guide',
+          });
+          revised = suggested;
         }
       }
     }
 
-    // 3. Prohibited terms and administrative words dictionary
+    // 5. Terminology dictionary fallback
     const termDict: Record<string, { term: string; rule: string; reason: string }> = {
       금일: { term: '오늘', rule: '[W-301] 어려운 한자어 순화', reason: "공공언어 권고에 따라 '금일'을 쉬운 일상어 '오늘'로 순화합니다." },
       익일: { term: '다음 날', rule: '[W-301] 어려운 한자어 순화', reason: "'익일' 대신 직관적인 '다음 날'을 사용합니다." },
@@ -670,45 +683,70 @@ class LocalLLMManager {
     };
 
     for (const [bad, info] of Object.entries(termDict)) {
-      if (revised.includes(bad)) {
+      if (revised.includes(bad) && bad !== info.term) {
         violations.push({
           rule: info.rule,
           originalPart: bad,
           suggestion: info.term,
           reason: info.reason,
+          ruleOrigin: 'guide',
         });
         revised = revised.replaceAll(bad, info.term);
       }
     }
 
-    // 4. Tone Level endings (Level 2 해요체 vs Level 3 명사형) for non-button components
-    if (toneLevel === 2 && !isButton) {
-      if (revised.endsWith('합니다.')) {
-        revised = revised.replace(/합니다\.$/, '해요.');
-      } else if (revised.endsWith('바랍니다.')) {
-        revised = revised.replace(/바랍니다\.$/, '해 주세요.');
-      }
-    } else if (toneLevel === 3 && !isButton) {
-      if (revised.endsWith('해 주세요.') || revised.endsWith('바랍니다.')) {
-        revised = revised.replace(/(해 주세요\.|바랍니다\.)$/, '확인');
-      }
-    }
+    // 6. Run Validation Layer
+    const validation = validateCorrectionResult(
+      inputSentence,
+      {
+        needsRevision: violations.length > 0 || revised !== inputSentence.trim(),
+        revised,
+        violations,
+      },
+      exactMatchRules
+    );
 
-    const needsRevision = violations.length > 0 || revised !== inputSentence.trim();
+    const debugData: DebugInspectionData = {
+      modelId: 'Deterministic Rule Engine',
+      webLLMVersion: 'N/A (Rule Engine Fallback)',
+      temperature: 0,
+      top_p: 0,
+      enableThinking: false,
+      inputSentence,
+      exactMatchRules,
+      regexMatchRules,
+      semanticTopK: semanticChunks.map((s) => ({
+        id: s.chunk.ruleId,
+        title: s.chunk.title,
+        score: s.score,
+        reason: s.matchReasons.join(', '),
+      })),
+      promptPassedGuides: exactMatchRules.map((r) => `${r.avoid.join(', ')} -> ${r.preferred.join(', ')}`).join(' | '),
+      finalPrompt: 'N/A (Rule Engine Mode)',
+      rawLLMResponse: 'N/A',
+      parsedResponse: null,
+      validatorRemovedItems: validation.removedSameWordViolations,
+      validationApplied: true,
+      finalResult: {
+        needsRevision: validation.needsRevision,
+        revised: validation.revised,
+        violations: validation.violations,
+        summary: validation.summary,
+      },
+    };
 
     return {
-      needsRevision,
+      needsRevision: validation.needsRevision,
       original: inputSentence,
-      revised: needsRevision ? revised : inputSentence,
-      violations,
-      summary: needsRevision
-        ? `사내 언어가이드 규정(${violations.map((v) => v.rule.split(' ')[0]).join(', ') || '가이드 표준'})에 따라 지양 표현을 정돈하고, 가이드 권장 형태로 교정했습니다.`
-        : '현재 사내 언어가이드 기준으로 수정이 필요한 부분이 없습니다.',
-      appliedRules: relevantRules.map((r) => r.chunk.title),
-      relevantChunks: relevantRules,
+      revised: validation.needsRevision ? validation.revised : inputSentence,
+      violations: validation.needsRevision ? validation.violations : [],
+      summary: validation.summary,
+      appliedRules: exactMatchRules.map((r) => r.category || r.id),
+      relevantChunks: semanticChunks,
       usedPastCases: selectedPastCases,
       isLocalLLM: false,
       modelName,
+      debugData,
     };
   }
 }
